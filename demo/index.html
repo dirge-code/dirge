@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>dirge wasm demo</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    textarea, input { width: 100%; box-sizing: border-box; font: inherit; }
+    textarea { min-height: 7rem; }
+    button { font: inherit; padding: .4rem .9rem; }
+    pre { white-space: pre-wrap; background: #111; padding: 1rem; border-radius: 6px; }
+    .muted { color: #888; }
+    #status { min-height: 1.5em; }
+  </style>
+</head>
+<body>
+  <h1>dirge wasm demo</h1>
+  <p class="muted">
+    Loads the <code>dirge_agent</code> wasm in the browser and drives it exactly like
+    the library path: <code>token_count(text)</code> and BYOK
+    <code>chat(api_key, prompt)</code>. The key never leaves this page except to the
+    DeepSeek endpoint.
+  </p>
+
+  <label for="api_key">DeepSeek API key (BYOK)</label>
+  <input id="api_key" type="password" placeholder="sk-..." autocomplete="off" />
+
+  <label for="prompt">Prompt</label>
+  <textarea id="prompt" placeholder="Ask dirge something..."></textarea>
+  <p class="muted">Tokens (llmtrim Anthropic estimator): <strong id="tokens">0</strong></p>
+
+  <button id="send" disabled>Send</button>
+  <p id="status" class="muted"></p>
+
+  <h2>Response</h2>
+  <pre id="output"></pre>
+
+  <h2>Agent with a JS tool</h2>
+  <p class="muted">
+    Runs the tool-calling agent loop (<code>AgentHandle</code>) with a
+    JS-registered <code>word_count</code> tool. Ask
+    <em>“How many words are in: the quick brown fox?”</em> and the model calls
+    the tool, then answers from its result.
+  </p>
+  <textarea id="agent_prompt" placeholder="How many words are in: the quick brown fox?"></textarea>
+  <button id="agent_send" disabled>Run agent</button>
+  <pre id="agent_output"></pre>
+
+  <h2>Session store</h2>
+  <p class="muted">
+    Pared-down in-memory session persistence (<code>SessionStore</code>):
+    create a session, append messages, then list what's stored. A JSON-backed
+    mirror of the terminal's save/load/delete/list contract.
+  </p>
+  <input id="session_name" type="text" placeholder="session name" />
+  <button id="session_create" disabled>New session</button>
+  <button id="session_append" disabled>Append "hello"</button>
+  <button id="session_list" disabled>List sessions</button>
+  <pre id="session_output"></pre>
+
+  <h2>Janet VM</h2>
+  <p class="muted">
+    A pared-down Janet interpreter compiled to wasm runs right in the page.
+    Try <code>(+ 1 2)</code>, <code>(map inc [1 2 3])</code>, or define
+    <code>(defn sq [x] (* x x))</code> then run <code>(sq 9)</code>. State
+    persists between evaluations.
+  </p>
+  <textarea id="janet_code" placeholder="(+ 1 2)"></textarea>
+  <button id="janet_run" disabled>Run Janet</button>
+  <pre id="janet_output"></pre>
+
+  <script src="../wasm-janet/dist/janet.js"></script>
+
+  <script type="module">
+    import init, { token_count, chat, AgentHandle, SessionStore } from '../pkg-web/dirge_agent.js';
+
+    const apiKey = document.getElementById('api_key');
+    const prompt = document.getElementById('prompt');
+    const tokens = document.getElementById('tokens');
+    const send = document.getElementById('send');
+    const status = document.getElementById('status');
+    const output = document.getElementById('output');
+    const agentPrompt = document.getElementById('agent_prompt');
+    const agentSend = document.getElementById('agent_send');
+    const agentOutput = document.getElementById('agent_output');
+    const sessionName = document.getElementById('session_name');
+    const sessionCreate = document.getElementById('session_create');
+    const sessionAppend = document.getElementById('session_append');
+    const sessionList = document.getElementById('session_list');
+    const sessionOutput = document.getElementById('session_output');
+    let sessionStore = null;
+    let sessionId = null;
+
+    prompt.addEventListener('input', () => {
+      tokens.textContent = token_count(prompt.value);
+    });
+
+    send.addEventListener('click', async () => {
+      send.disabled = true;
+      status.textContent = 'running...';
+      output.textContent = '';
+      try {
+        const text = await chat(apiKey.value, prompt.value);
+        output.textContent = text;
+        status.textContent = 'done';
+      } catch (err) {
+        status.textContent = 'error: ' + err;
+      } finally {
+        send.disabled = false;
+      }
+    });
+
+    agentSend.addEventListener('click', async () => {
+      agentSend.disabled = true;
+      agentOutput.textContent = '';
+      status.textContent = 'running agent...';
+      try {
+        const handle = new AgentHandle(apiKey.value);
+        handle.add_js_tool(
+          'word_count',
+          'Count the whitespace-separated words in the given text',
+          JSON.stringify({
+            type: 'object',
+            properties: { text: { type: 'string' } },
+            required: ['text'],
+          }),
+          (argsJson) => {
+            const { text } = JSON.parse(argsJson);
+            return String((text || '').trim().split(/\s+/).filter(Boolean).length);
+          }
+        );
+        const text = await handle.run(agentPrompt.value);
+        agentOutput.textContent = text;
+        status.textContent = 'done';
+      } catch (err) {
+        agentOutput.textContent = '';
+        status.textContent = 'error: ' + err;
+      } finally {
+        agentSend.disabled = false;
+      }
+    });
+
+    sessionCreate.addEventListener('click', () => {
+      sessionId = sessionStore.create(sessionName.value || 'session');
+      sessionOutput.textContent = 'created ' + sessionId;
+    });
+
+    sessionAppend.addEventListener('click', () => {
+      if (!sessionId) {
+        sessionOutput.textContent = 'create a session first';
+        return;
+      }
+      sessionStore.append_message(sessionId, 'user', 'hello');
+      sessionOutput.textContent = JSON.stringify(JSON.parse(sessionStore.get(sessionId)), null, 2);
+    });
+
+    sessionList.addEventListener('click', () => {
+      sessionOutput.textContent = JSON.stringify(JSON.parse(sessionStore.list()), null, 2);
+    });
+
+    try {
+      await init();
+      tokens.textContent = token_count(prompt.value);
+      send.disabled = false;
+      agentSend.disabled = false;
+      sessionStore = new SessionStore();
+      sessionCreate.disabled = false;
+      sessionAppend.disabled = false;
+      sessionList.disabled = false;
+      status.textContent = 'wasm loaded';
+    } catch (err) {
+      status.textContent = 'failed to load wasm: ' + err;
+    }
+  </script>
+
+  <script type="module">
+    const janetCode = document.getElementById('janet_code');
+    const janetRun = document.getElementById('janet_run');
+    const janetOutput = document.getElementById('janet_output');
+
+    try {
+      const mod = await window.createJanetModule();
+      mod.ccall('janet_wasm_init', null, [], []);
+      const evalFn = mod.cwrap('janet_wasm_eval', 'number', ['string']);
+      const evalJanet = (code) => {
+        const p = evalFn(code);
+        const s = mod.UTF8ToString(p);
+        mod._free(p);
+        return s;
+      };
+      janetRun.addEventListener('click', () => {
+        janetOutput.textContent = evalJanet(janetCode.value);
+      });
+      janetRun.disabled = false;
+    } catch (err) {
+      janetOutput.textContent = 'failed to load Janet wasm: ' + err;
+    }
+  </script>
+</body>
+</html>

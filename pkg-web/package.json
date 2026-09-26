@@ -1,0 +1,32 @@
+{
+  "name": "dirge-agent",
+  "type": "module",
+  "collaborators": [
+    "Yogthos <yogthos@gmail.com>"
+  ],
+  "description": "Minimalistic coding agent written in Rust, optimized for memory footprint and performance",
+  "version": "0.25.6",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dirge-code/dirge"
+  },
+  "files": [
+    "dirge_agent_bg.wasm",
+    "dirge_agent.js",
+    "dirge_agent.d.ts"
+  ],
+  "main": "dirge_agent.js",
+  "homepage": "https://github.com/dirge-code/dirge",
+  "types": "dirge_agent.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ],
+  "keywords": [
+    "ai",
+    "cli",
+    "agent",
+    "llm",
+    "tui"
+  ]
+}
