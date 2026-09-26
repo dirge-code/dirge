@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>dirge wasm demo</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    textarea, input { width: 100%; box-sizing: border-box; font: inherit; }
+    textarea { min-height: 7rem; }
+    button { font: inherit; padding: .4rem .9rem; }
+    pre { white-space: pre-wrap; background: #111; padding: 1rem; border-radius: 6px; }
+    .muted { color: #888; }
+    #status { min-height: 1.5em; }
+  </style>
+</head>
+<body>
+  <h1>dirge wasm demo</h1>
+  <p class="muted">
+    Loads the <code>dirge_agent</code> wasm in the browser and drives it exactly like
+    the library path: <code>token_count(text)</code> and BYOK
+    <code>chat(api_key, prompt)</code>. The key never leaves this page except to the
+    DeepSeek endpoint.
+  </p>
+
+  <label for="api_key">DeepSeek API key (BYOK)</label>
+  <input id="api_key" type="password" placeholder="sk-..." autocomplete="off" />
+
+  <label for="prompt">Prompt</label>
+  <textarea id="prompt" placeholder="Ask dirge something..."></textarea>
+  <p class="muted">Tokens (llmtrim Anthropic estimator): <strong id="tokens">0</strong></p>
+
+  <button id="send" disabled>Send</button>
+  <p id="status" class="muted"></p>
+
+  <h2>Response</h2>
+  <pre id="output"></pre>
+
+  <script type="module">
+    import init, { token_count, chat } from '../pkg-web/dirge_agent.js';
+
+    const apiKey = document.getElementById('api_key');
+    const prompt = document.getElementById('prompt');
+    const tokens = document.getElementById('tokens');
+    const send = document.getElementById('send');
+    const status = document.getElementById('status');
+    const output = document.getElementById('output');
+
+    prompt.addEventListener('input', () => {
+      tokens.textContent = token_count(prompt.value);
+    });
+
+    send.addEventListener('click', async () => {
+      send.disabled = true;
+      status.textContent = 'running...';
+      output.textContent = '';
+      try {
+        const text = await chat(apiKey.value, prompt.value);
+        output.textContent = text;
+        status.textContent = 'done';
+      } catch (err) {
+        status.textContent = 'error: ' + err;
+      } finally {
+        send.disabled = false;
+      }
+    });
+
+    try {
+      await init();
+      tokens.textContent = token_count(prompt.value);
+      send.disabled = false;
+      status.textContent = 'wasm loaded';
+    } catch (err) {
+      status.textContent = 'failed to load wasm: ' + err;
+    }
+  </script>
+</body>
+</html>
