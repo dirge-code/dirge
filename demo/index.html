@@ -37,6 +37,19 @@
   <h2>Response</h2>
   <pre id="output"></pre>
 
+  <h2>Janet VM</h2>
+  <p class="muted">
+    A pared-down Janet interpreter compiled to wasm runs right in the page.
+    Try <code>(+ 1 2)</code>, <code>(map inc [1 2 3])</code>, or define
+    <code>(defn sq [x] (* x x))</code> then run <code>(sq 9)</code>. State
+    persists between evaluations.
+  </p>
+  <textarea id="janet_code" placeholder="(+ 1 2)"></textarea>
+  <button id="janet_run" disabled>Run Janet</button>
+  <pre id="janet_output"></pre>
+
+  <script src="../wasm-janet/dist/janet.js"></script>
+
   <script type="module">
     import init, { token_count, chat } from '../pkg-web/dirge_agent.js';
 
@@ -73,6 +86,30 @@
       status.textContent = 'wasm loaded';
     } catch (err) {
       status.textContent = 'failed to load wasm: ' + err;
+    }
+  </script>
+
+  <script type="module">
+    const janetCode = document.getElementById('janet_code');
+    const janetRun = document.getElementById('janet_run');
+    const janetOutput = document.getElementById('janet_output');
+
+    try {
+      const mod = await window.createJanetModule();
+      mod.ccall('janet_wasm_init', null, [], []);
+      const evalFn = mod.cwrap('janet_wasm_eval', 'number', ['string']);
+      const evalJanet = (code) => {
+        const p = evalFn(code);
+        const s = mod.UTF8ToString(p);
+        mod._free(p);
+        return s;
+      };
+      janetRun.addEventListener('click', () => {
+        janetOutput.textContent = evalJanet(janetCode.value);
+      });
+      janetRun.disabled = false;
+    } catch (err) {
+      janetOutput.textContent = 'failed to load Janet wasm: ' + err;
     }
   </script>
 </body>
