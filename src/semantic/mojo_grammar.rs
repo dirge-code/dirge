@@ -12,6 +12,7 @@
 
 use tree_sitter_language::LanguageFn;
 
+#[link(name = "tree-sitter-mojo", kind = "static")]
 unsafe extern "C" {
     /// Defined by the vendored `parser.c`, linked in as `libtree-sitter-mojo.a`.
     fn tree_sitter_mojo() -> *const ();
