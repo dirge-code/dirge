@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use rig::OneOrMany;
 use rig::completion::message::ToolCall;
 use rig::completion::{AssistantContent, CompletionResponse, Message, ToolDefinition};
 use rig::wasm_compat::WasmBoxedFuture;
@@ -78,6 +79,20 @@ impl Agent {
     /// Run one user turn: send the prompt, execute any tool calls the model
     /// makes, and return the final assistant text.
     pub async fn run(&self, prompt: String) -> Result<String, String> {
+        self.run_transcript(vec![Message::user(prompt)])
+            .await
+            .map(|(text, _history)| text)
+    }
+
+    /// Run the tool-calling loop over an existing transcript and return the
+    /// final assistant text plus the updated transcript. The assistant's tool
+    /// calls, their results, and its final text are appended in order, so a
+    /// stateful caller can feed the transcript back in on the next turn
+    /// (prepending its own user message) to keep conversation context.
+    pub async fn run_transcript(
+        &self,
+        mut history: Vec<Message>,
+    ) -> Result<(String, Vec<Message>), String> {
         let definitions: Vec<ToolDefinition> = self
             .tools
             .iter()
@@ -88,34 +103,42 @@ impl Agent {
             })
             .collect();
 
-        let mut history: Vec<Message> = vec![Message::user(prompt)];
-
         for _ in 0..self.max_rounds {
             let response = self
                 .completer
                 .complete(history.clone(), definitions.clone())
                 .await?;
 
+            let mut text_parts: Vec<String> = Vec::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
-            let mut text: Option<String> = None;
 
             for item in response.choice {
                 match item {
-                    AssistantContent::Text(t) => text = Some(t.text),
+                    AssistantContent::Text(t) => text_parts.push(t.text),
                     AssistantContent::ToolCall(tc) => tool_calls.push(tc),
                     _ => {}
                 }
             }
 
+            let text = text_parts.join("\n");
             if tool_calls.is_empty() {
-                return text
-                    .ok_or_else(|| "agent produced neither text nor a tool call".to_string());
+                if text.is_empty() {
+                    return Err("agent produced neither text nor a tool call".to_string());
+                }
+                history.push(Message::assistant(text.clone()));
+                return Ok((text, history));
             }
 
-            // Assistant tool calls first, then their results, in order.
-            for tc in &tool_calls {
-                history.push(Message::from(tc.clone()));
-            }
+            // One assistant message carrying any text alongside the tool
+            // calls, so model prose emitted with a call is not lost.
+            let mut contents: Vec<AssistantContent> =
+                text_parts.into_iter().map(AssistantContent::text).collect();
+            contents.extend(tool_calls.iter().cloned().map(AssistantContent::ToolCall));
+            // `many` rejects an empty list; a tool-call response is non-empty.
+            history.push(Message::from(
+                OneOrMany::many(contents).expect("tool-call response is non-empty"),
+            ));
+
             for tc in &tool_calls {
                 let result = self
                     .dispatch(&tc.function.name, tc.function.arguments.clone())
@@ -289,6 +312,33 @@ mod tests {
 
         let err = agent.run("hi".to_string()).await.unwrap_err();
         assert!(err.contains("rounds"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn run_transcript_accumulates_across_turns() {
+        let completer = Arc::new(ScriptedCompleter::new(vec![
+            text_response("first"),
+            text_response("second"),
+        ]));
+        let agent = Agent::new(completer.clone());
+
+        let (first, history) = agent
+            .run_transcript(vec![Message::user("turn one".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(first, "first");
+
+        let mut next = history;
+        next.push(Message::user("turn two".to_string()));
+        let (second, _) = agent.run_transcript(next).await.unwrap();
+        assert_eq!(second, "second");
+
+        let seen = completer.seen.lock().unwrap();
+        // The second completion saw the prior turn in full: user turn one,
+        // assistant "first", then user turn two.
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].len(), 3);
+        assert!(matches!(&seen[1][1], Message::Assistant { .. }));
     }
 
     #[test]

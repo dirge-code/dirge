@@ -64,12 +64,14 @@ pub async fn chat(api_key: String, prompt: String) -> Result<String, JsValue> {
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    for item in response.choice {
-        if let AssistantContent::Text(text) = item {
-            return Ok(text.text);
-        }
-    }
-    Ok(String::new())
+    response
+        .choice
+        .into_iter()
+        .find_map(|item| match item {
+            AssistantContent::Text(text) => Some(text.text),
+            _ => None,
+        })
+        .ok_or_else(|| JsValue::from_str("completion returned no text"))
 }
 
 /// DeepSeek backend for the [`crate::agent_core::Agent`] loop. Adapts a rig
@@ -207,6 +209,7 @@ impl crate::agent_core::Tool for JsTool {
 pub struct AgentHandle {
     api_key: String,
     tools: Vec<Arc<dyn crate::agent_core::Tool>>,
+    history: Vec<rig::completion::Message>,
 }
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
@@ -217,6 +220,7 @@ impl AgentHandle {
         Self {
             api_key,
             tools: Vec::new(),
+            history: Vec::new(),
         }
     }
 
@@ -260,8 +264,9 @@ impl AgentHandle {
     }
 
     /// Run one user turn with the current tool set over DeepSeek, returning the
-    /// final assistant text.
-    pub async fn run(&self, prompt: String) -> Result<String, JsValue> {
+    /// final assistant text. The conversation transcript is carried across
+    /// turns, so a subsequent `run` continues the same session.
+    pub async fn run(&mut self, prompt: String) -> Result<String, JsValue> {
         let completer = Arc::new(
             DeepSeekCompleter::new(self.api_key.clone()).map_err(|e| JsValue::from_str(&e))?,
         );
@@ -269,7 +274,13 @@ impl AgentHandle {
         for tool in &self.tools {
             agent = agent.with_tool(tool.clone());
         }
-        agent.run(prompt).await.map_err(|e| JsValue::from_str(&e))
+        self.history.push(rig::completion::Message::user(prompt));
+        let (text, history) = agent
+            .run_transcript(self.history.clone())
+            .await
+            .map_err(|e| JsValue::from_str(&e))?;
+        self.history = history;
+        Ok(text)
     }
 }
 
@@ -314,8 +325,8 @@ impl SessionStore {
     }
 
     /// List all sessions as a JSON array string, newest first.
-    pub fn list(&self) -> String {
-        serde_json::to_string(&self.inner.list()).unwrap_or_else(|_| "[]".to_string())
+    pub fn list(&self) -> Result<String, JsValue> {
+        serde_json::to_string(&self.inner.list()).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Delete a session (idempotent).
@@ -323,5 +334,12 @@ impl SessionStore {
         self.inner
             .delete(&id)
             .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
