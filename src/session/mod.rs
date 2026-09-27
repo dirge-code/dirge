@@ -1,7 +1,6 @@
 pub mod compact;
 pub mod rehydrate;
 pub mod storage;
-pub mod store;
 
 use std::collections::HashMap;
 
