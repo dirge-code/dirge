@@ -34,7 +34,8 @@ export class AgentHandle {
     constructor(api_key: string);
     /**
      * Run one user turn with the current tool set over DeepSeek, returning the
-     * final assistant text.
+     * final assistant text. The conversation transcript is carried across
+     * turns, so a subsequent `run` continues the same session.
      */
     run(prompt: string): Promise<string>;
 }
@@ -128,46 +129,42 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_agenthandle_free: (a: number, b: number) => void;
     readonly __wbg_sessionstore_free: (a: number, b: number) => void;
-    readonly agent_chat: (a: number, b: number, c: number, d: number) => any;
+    readonly agent_chat: (a: number, b: number, c: number, d: number) => number;
     readonly agenthandle_add_echo_tool: (a: number) => void;
-    readonly agenthandle_add_js_tool: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: any) => [number, number];
-    readonly agenthandle_call_tool: (a: number, b: number, c: number, d: number, e: number) => any;
+    readonly agenthandle_add_js_tool: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
+    readonly agenthandle_call_tool: (a: number, b: number, c: number, d: number, e: number) => number;
     readonly agenthandle_new: (a: number, b: number) => number;
-    readonly agenthandle_run: (a: number, b: number, c: number) => any;
-    readonly chat: (a: number, b: number, c: number, d: number) => any;
-    readonly sessionstore_append_message: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
-    readonly sessionstore_create: (a: number, b: number, c: number) => [number, number];
-    readonly sessionstore_delete: (a: number, b: number, c: number) => [number, number];
-    readonly sessionstore_get: (a: number, b: number, c: number) => [number, number, number, number];
-    readonly sessionstore_list: (a: number) => [number, number];
+    readonly agenthandle_run: (a: number, b: number, c: number) => number;
+    readonly chat: (a: number, b: number, c: number, d: number) => number;
+    readonly sessionstore_append_message: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly sessionstore_create: (a: number, b: number, c: number, d: number) => void;
+    readonly sessionstore_delete: (a: number, b: number, c: number, d: number) => void;
+    readonly sessionstore_get: (a: number, b: number, c: number, d: number) => void;
+    readonly sessionstore_list: (a: number, b: number) => void;
     readonly sessionstore_new: () => number;
     readonly token_count: (a: number, b: number) => number;
     readonly __wbg_intounderlyingbytesource_free: (a: number, b: number) => void;
+    readonly __wbg_intounderlyingsink_free: (a: number, b: number) => void;
+    readonly __wbg_intounderlyingsource_free: (a: number, b: number) => void;
     readonly intounderlyingbytesource_autoAllocateChunkSize: (a: number) => number;
     readonly intounderlyingbytesource_cancel: (a: number) => void;
-    readonly intounderlyingbytesource_pull: (a: number, b: any) => any;
-    readonly intounderlyingbytesource_start: (a: number, b: any) => void;
+    readonly intounderlyingbytesource_pull: (a: number, b: number) => number;
+    readonly intounderlyingbytesource_start: (a: number, b: number) => void;
     readonly intounderlyingbytesource_type: (a: number) => number;
-    readonly __wbg_intounderlyingsource_free: (a: number, b: number) => void;
+    readonly intounderlyingsink_abort: (a: number, b: number) => number;
+    readonly intounderlyingsink_close: (a: number) => number;
+    readonly intounderlyingsink_write: (a: number, b: number) => number;
     readonly intounderlyingsource_cancel: (a: number) => void;
-    readonly intounderlyingsource_pull: (a: number, b: any) => any;
-    readonly __wbg_intounderlyingsink_free: (a: number, b: number) => void;
-    readonly intounderlyingsink_abort: (a: number, b: any) => any;
-    readonly intounderlyingsink_close: (a: number) => any;
-    readonly intounderlyingsink_write: (a: number, b: any) => any;
-    readonly wasm_bindgen__convert__closures_____invoke__h1214871e6dac7a9b: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h5a7dad4203aed81f: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__heffd7ef854a7947f: (a: number, b: number) => number;
-    readonly wasm_bindgen__convert__closures_____invoke__h4389e72fa9435afd: (a: number, b: number) => void;
-    readonly __wbindgen_malloc: (a: number, b: number) => number;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_exn_store: (a: number) => void;
-    readonly __externref_table_alloc: () => number;
-    readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __wbindgen_destroy_closure: (a: number, b: number) => void;
-    readonly __externref_table_dealloc: (a: number) => void;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_start: () => void;
+    readonly intounderlyingsource_pull: (a: number, b: number) => number;
+    readonly __wasm_bindgen_func_elem_1445: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1466: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_735: (a: number, b: number) => void;
+    readonly __wbindgen_export: (a: number, b: number) => number;
+    readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_export3: (a: number) => void;
+    readonly __wbindgen_export4: (a: number, b: number) => void;
+    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+    readonly __wbindgen_export5: (a: number, b: number, c: number) => void;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;
