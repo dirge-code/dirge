@@ -137,6 +137,7 @@ pub struct RigToolAdapter {
     /// Per-tool dispatch budget hook (dirge-9tl3). `None` → the shared
     /// `timeouts.tool_call` ceiling. See `LoopTool::call_budget`.
     call_budget_fn: Option<CallBudgetFn>,
+    async_capable: bool,
 }
 
 impl std::fmt::Debug for RigToolAdapter {
@@ -181,6 +182,7 @@ impl RigToolAdapter {
             flat_parameters,
             execution_mode: None,
             call_budget_fn: None,
+            async_capable: false,
         }
     }
     /// that mutate shared filesystem state or process state
@@ -197,6 +199,11 @@ impl RigToolAdapter {
     /// subagents) — so the watchdog never cuts an in-bounds call.
     pub fn with_call_budget(mut self, f: CallBudgetFn) -> Self {
         self.call_budget_fn = Some(f);
+        self
+    }
+
+    pub fn with_async_support(mut self) -> Self {
+        self.async_capable = true;
         self
     }
 
@@ -218,6 +225,7 @@ impl RigToolAdapter {
             flat_parameters: None,
             execution_mode: None,
             call_budget_fn: None,
+            async_capable: false,
         }
     }
 }
@@ -252,6 +260,10 @@ impl LoopTool for RigToolAdapter {
 
     fn call_budget(&self, args: &Value) -> Option<std::time::Duration> {
         self.call_budget_fn.as_ref().and_then(|f| f(args))
+    }
+
+    fn supports_async(&self, _args: &Value) -> bool {
+        self.async_capable
     }
 
     /// Re-nests flat dot-notation args when the schema was

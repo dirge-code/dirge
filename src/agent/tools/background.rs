@@ -562,7 +562,9 @@ impl BackgroundStore {
     /// `task.rs` so `cancel_all` has something to abort on session
     /// switch. Only attaches when the task is still `Running` — if the
     /// spawned closure already finished (called `notify` from another
-    /// thread) the state is terminal and the handle is dropped.
+    /// thread) the state is terminal and the handle is aborted. A session
+    /// switch can also cancel the task before attachment; aborting the late
+    /// handle prevents it from escaping that cancellation.
     /// Re-attaching for a still-running id replaces and drops the
     /// previous handle.
     pub fn attach_handle(&self, id: &str, handle: JoinHandle<()>) {
@@ -577,6 +579,7 @@ impl BackgroundStore {
             .get(id)
             .is_some_and(|t| matches!(t.state, TaskState::Running));
         if !is_running {
+            handle.abort();
             return;
         }
         if let Some(prev) = inner.handles.insert(id.to_string(), handle) {

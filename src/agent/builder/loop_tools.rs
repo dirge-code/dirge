@@ -708,7 +708,13 @@ pub async fn build_loop_tools(
         )
         .await,
     );
-    tools.push(wrap(tools::BashOutputTool::new(tools::bg_shell::global()), None).await);
+    tools.push(Arc::new(
+        RigToolAdapter::new(Box::new(tools::BashOutputTool::new(
+            tools::bg_shell::global(),
+        )))
+        .await
+        .with_async_support(),
+    ));
     tools.push(wrap(tools::KillShellTool::new(tools::bg_shell::global()), None).await);
 
     // Read-only batch.

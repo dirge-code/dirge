@@ -97,7 +97,7 @@ pub struct ToolCall {
 /// Internal: outcome of `prepare_tool_call`. Port of pi's
 /// `PreparedToolCall | ImmediateToolCallOutcome` union
 /// (agent-loop.ts:518-540).
-enum PrepareOutcome {
+pub(super) enum PrepareOutcome {
     /// Tool found and validated; ready for execute.
     Prepared {
         tool: Arc<dyn LoopTool>,
@@ -118,18 +118,18 @@ enum PrepareOutcome {
 
 /// Internal: outcome of `execute_prepared_tool_call`. Port of pi
 /// `ExecutedToolCallOutcome` (agent-loop.ts:531-534).
-struct ExecutedOutcome {
-    result: LoopToolResult,
-    is_error: bool,
+pub(super) struct ExecutedOutcome {
+    pub(super) result: LoopToolResult,
+    pub(super) is_error: bool,
 }
 
 /// Internal: outcome of `finalize_executed_tool_call`. Port of pi
 /// `FinalizedToolCallOutcome` (agent-loop.ts:536-540).
 #[derive(Debug, Clone)]
-struct FinalizedOutcome {
+pub(super) struct FinalizedOutcome {
     tool_call: ToolCall,
-    result: LoopToolResult,
-    is_error: bool,
+    pub(super) result: LoopToolResult,
+    pub(super) is_error: bool,
 }
 
 /// Execute a batch of tool calls SEQUENTIALLY. Faithful port of
@@ -238,7 +238,7 @@ pub async fn execute_tool_calls_sequential(
 /// `run.rs`'s `tool_result_excerpt`, but reads the pre-conversion
 /// `LoopToolResult` shape (`content` is `Vec<Value>` of
 /// `{"type":"text","text":…}`) rather than the typed `ContentBlock`s.
-fn executed_result_text(result: &LoopToolResult) -> String {
+pub(super) fn executed_result_text(result: &LoopToolResult) -> String {
     result
         .content
         .iter()
@@ -318,7 +318,7 @@ async fn execute_prepared_tool_call_with_retry(
 /// future phase can add a validator if a real schema-mismatch
 /// case surfaces — for now any deserialization mismatch surfaces
 /// from the tool's `execute` as a normal error.
-async fn prepare_tool_call(
+pub(super) async fn prepare_tool_call(
     context: &Context,
     assistant_message: &AssistantMessage,
     tool_call: &ToolCall,
@@ -718,7 +718,7 @@ async fn execute_prepared_tool_call(
 /// `AfterToolCallResult` REPLACES the executed result's
 /// corresponding field IN FULL. Omitted (None) fields keep the
 /// original.
-async fn finalize_executed_tool_call(
+pub(super) async fn finalize_executed_tool_call(
     context: &Context,
     assistant_message: &AssistantMessage,
     tool_call: &ToolCall,
@@ -845,7 +845,7 @@ pub(crate) fn maybe_arm_escalation_for_syntactic_failure(
 
 /// Build the "tool not found" / "operation aborted" / "blocked"
 /// error result. Port of pi `createErrorToolResult` (line 710).
-fn create_error_tool_result(message: &str) -> LoopToolResult {
+pub(super) fn create_error_tool_result(message: &str) -> LoopToolResult {
     LoopToolResult {
         content: vec![serde_json::json!({"type": "text", "text": message})],
         details: serde_json::json!({}),
@@ -862,7 +862,7 @@ fn create_error_tool_result(message: &str) -> LoopToolResult {
 /// possible, OR prepended to the first text block. Non-text
 /// results (image-only, structured-only) get a fresh text block
 /// inserted at index 0.
-fn prepend_notes_to_result(result: &mut LoopToolResult, notes: &[String]) {
+pub(super) fn prepend_notes_to_result(result: &mut LoopToolResult, notes: &[String]) {
     if notes.is_empty() {
         return;
     }

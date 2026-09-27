@@ -219,6 +219,20 @@ async fn build_loop_tools_produces_core_registry() {
             "missing built-in {expected} in {names:?}"
         );
     }
+    assert!(
+        !tools
+            .iter()
+            .find(|t| t.name() == "bash")
+            .unwrap()
+            .supports_async(&serde_json::json!({"command":"echo ok"}))
+    );
+    assert!(
+        tools
+            .iter()
+            .find(|t| t.name() == "bash_output")
+            .unwrap()
+            .supports_async(&serde_json::json!({"id":"test"}))
+    );
 }
 
 /// dirge-yof4: a memory-store load failure (fresh-state I/O problems,

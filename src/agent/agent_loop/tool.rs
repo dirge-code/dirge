@@ -171,6 +171,10 @@ pub trait LoopTool: Send + Sync + std::fmt::Debug {
         None
     }
 
+    fn supports_async(&self, _args: &Value) -> bool {
+        false
+    }
+
     /// Compatibility shim run BEFORE schema validation. Pi field
     /// `prepareArguments?(args: unknown): Static<TParameters>`
     /// (types.ts:368). Mutates raw provider arguments into a
@@ -207,6 +211,42 @@ pub trait LoopTool: Send + Sync + std::fmt::Debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_tool_does_not_support_async() {
+        struct Plain;
+        impl std::fmt::Debug for Plain {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Plain")
+            }
+        }
+        impl LoopTool for Plain {
+            fn name(&self) -> &str {
+                "plain"
+            }
+            fn description(&self) -> &str {
+                "plain"
+            }
+            fn label(&self) -> &str {
+                "plain"
+            }
+            fn parameters(&self) -> &Value {
+                static P: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+                P.get_or_init(|| serde_json::json!({"type":"object"}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _: &'a str,
+                _: Value,
+                _: AbortSignal,
+                _: LoopToolUpdate,
+            ) -> Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>>
+            {
+                Box::pin(async { unreachable!() })
+            }
+        }
+        assert!(!Plain.supports_async(&serde_json::json!({})));
+    }
 
     /// `AbortSignal::is_cancelled()` is false on construction; flips
     /// true after `cancel()`; clones share state.

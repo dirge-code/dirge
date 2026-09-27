@@ -784,6 +784,16 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         messages: cfg.history.iter().map(loop_message_to_value).collect(),
         tools: cfg.tools,
     };
+    if let Some(store) = cfg.bg_store {
+        context
+            .tools
+            .push(Arc::new(super::run_async::RunAsyncTool::new(
+                context.tools.clone(),
+                store,
+                context.clone(),
+                loop_config.clone(),
+            )));
+    }
     // The run's tool set, for the bridge's answer-vs-call filter (dirge-n00z).
     // Captured here because `context` moves into the loop task below, and the
     // loop never adds or removes tools mid-run, so one snapshot holds.
