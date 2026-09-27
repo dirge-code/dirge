@@ -161,6 +161,42 @@ jobs:
         if: matrix.name == 'default' || matrix.name == 'plugin' || matrix.name == 'dap' || matrix.name == 'all-features'
         run: cargo nextest run --bin dirge ${{ matrix.features }}
 
+  # The wasm slice (src/lib.rs + agent_core/session_core, gated on
+  # `--no-default-features --features wasm` under wasm32) is invisible to the
+  # native build matrix above: no job compiles the wasm target, and its
+  # native tests live in `cargo test --lib` while `nextest` only runs the
+  # `--bin dirge` suite. A regression (a native dep leaking into the wasm
+  # graph, a broken `#[wasm_bindgen]` export, or a broken tool loop) would
+  # otherwise reach main unnoticed. This job compiles the wasm target and
+  # runs the Node suite against a fresh wasm-pack nodejs build.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (wasm32)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Native lib tests (wasm core)
+        run: cargo test --lib
+
+      - name: Build wasm lib
+        run: cargo build --lib --target wasm32-unknown-unknown --no-default-features --features wasm
+
+      - name: Build nodejs artifact
+        run: wasm-pack build --target nodejs --dev --no-opt --out-dir pkg -- --no-default-features --features wasm
+
+      - name: Node tests
+        run: node --test tests/wasm_exports.test.mjs tests/wasm_session.test.mjs tests/janet_wasm.test.mjs
+
   # Windows is only built at release time (release.yml, tag-triggered),
   # so platform-specific breakage used to slip through until a release.
   # The Janet `plugin` feature can't build on MSVC (evil_janet/_setjmp,
