@@ -35,13 +35,21 @@ use crate::ui::colors::parse_plugin_color;
 /// panel to accumulate stale `✓`/`✗` rows for every subagent that
 /// ever ran in the session.
 pub(crate) fn apply_subagent_panel_event(
-    rows: &mut indexmap::IndexMap<String, Option<String>>,
+    rows: &mut indexmap::IndexMap<String, SubagentLive>,
     event: &SubagentChatEvent,
 ) {
     use SubagentChatEvent as E;
     match event {
         E::Spawn { id, agent, .. } => {
-            rows.insert(id.clone(), agent.clone());
+            rows.insert(
+                id.clone(),
+                SubagentLive {
+                    agent: agent.clone(),
+                    activity: None,
+                    tool_calls: 0,
+                    started: std::time::Instant::now(),
+                },
+            );
         }
         // Terminal events evict the row — the chat tab keeps the
         // full transcript, so leaving the panel row in would just
@@ -49,10 +57,53 @@ pub(crate) fn apply_subagent_panel_event(
         E::Complete { id, .. } | E::Failed { id, .. } | E::Aborted { id } => {
             rows.shift_remove(id);
         }
-        // dirge-781c: streaming events DON'T mutate the panel — the
-        // row's lifecycle is Spawn → terminal. The chat-tab side of
-        // the UI handles the per-token / per-tool rendering.
-        E::Token { .. } | E::Reasoning { .. } | E::ToolCall { .. } | E::ToolResult { .. } => {}
+        // Streaming events refresh the row's one-line preview, so the user
+        // sees what each subagent is doing without opening its tab. The
+        // call is the telling line; it stays until the next call.
+        E::ToolCall {
+            id,
+            tool_name,
+            args_summary,
+        } => {
+            if let Some(row) = rows.get_mut(id) {
+                row.tool_calls += 1;
+                row.activity = Some(if args_summary.is_empty() {
+                    tool_name.clone()
+                } else {
+                    format!("{tool_name} {args_summary}")
+                });
+            }
+        }
+        E::Reasoning { id, .. } => {
+            if let Some(row) = rows.get_mut(id)
+                && row.activity.is_none()
+            {
+                row.activity = Some("thinking…".into());
+            }
+        }
+        E::Token { .. } | E::ToolResult { .. } => {}
+    }
+}
+
+/// Live state behind one `[AGENTS]` row, kept from spawn until a terminal
+/// event and snapshotted into a [`crate::ui::renderer::SubagentStatusRow`].
+#[derive(Debug, Clone)]
+pub(crate) struct SubagentLive {
+    pub(crate) agent: Option<String>,
+    pub(crate) activity: Option<String>,
+    pub(crate) tool_calls: usize,
+    pub(crate) started: std::time::Instant,
+}
+
+impl SubagentLive {
+    pub(crate) fn status_row(&self, id: &str) -> crate::ui::renderer::SubagentStatusRow {
+        crate::ui::renderer::SubagentStatusRow {
+            id_short: id.chars().take(6).collect(),
+            agent: self.agent.clone(),
+            activity: self.activity.clone(),
+            tool_calls: self.tool_calls,
+            elapsed_secs: self.started.elapsed().as_secs(),
+        }
     }
 }
 

@@ -5,17 +5,18 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::dialect;
-use super::domain::{HookEvent, HookOutcome, system_reminder};
+use super::domain::{HookEvent, HookOutcome, Submission, system_reminder};
 use super::{CommandHooks, HookBinding};
+use super::{dialect, policy};
 use crate::agent::agent_loop::hooks::{
     AfterToolCallContext, AfterToolCallFn, BeforeToolCallContext, BeforeToolCallFn,
     BeforeToolCallReturn, GetFollowupMessagesFn,
 };
 use crate::agent::agent_loop::message::{LoopMessage, UserMessage};
 use crate::agent::agent_loop::result::{AfterToolCallResult, BeforeToolCallResult, LoopToolResult};
+use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 
 /// Consecutive `Stop` blocks tolerated before the loop is let go.
 pub const MAX_CONSECUTIVE_STOP_BLOCKS: usize = 8;
@@ -25,17 +26,20 @@ fn cwd() -> std::path::PathBuf {
 }
 
 /// `PreToolUse`: each Claude call a dirge call restates to is judged;
-/// the first block refuses the call, context rides on its result, and a
-/// single call's `updatedInput` is folded back onto the args.
+/// the first block refuses the call, an "ask" waits on the user's answer
+/// at the permission prompt, context rides on its result, and a single
+/// call's `updatedInput` is folded back onto the args.
 pub fn pre_tool_hook(binding: HookBinding, session_id: Option<String>) -> BeforeToolCallFn {
     Arc::new(move |ctx: BeforeToolCallContext| {
         let hooks = binding.hooks.clone();
+        let ask = binding.ask.clone();
         let session_id = session_id.clone();
         Box::pin(async move {
             let calls = dialect::claude_calls(&ctx.tool_call_name, &ctx.args, &cwd());
             let single = calls.len() == 1;
             let mut outcome = HookOutcome::default();
             let mut blocked_as = None;
+            let mut asked_as = None;
             for (claude_name, input) in calls {
                 let payload = hooks.payload(
                     HookEvent::PreToolUse,
@@ -47,15 +51,73 @@ pub fn pre_tool_hook(binding: HookBinding, session_id: Option<String>) -> Before
                     .run_async(HookEvent::PreToolUse, targets, payload)
                     .await;
                 let blocks = one.block.is_some();
+                if asked_as.is_none() && one.ask.is_some() {
+                    asked_as = Some((claude_name.clone(), input));
+                }
                 outcome = outcome.combine(one);
                 if blocks {
                     blocked_as = Some(claude_name);
                     break;
                 }
             }
+            let pending = outcome.pending_ask().map(str::to_string);
+            if let (Some(reason), Some((claude_name, input))) = (pending, asked_as)
+                && let Some(refusal) = confirm(ask.as_ref(), &claude_name, &input, &reason).await
+            {
+                outcome.block = Some(refusal);
+                blocked_as = Some(claude_name);
+            }
             pre_tool_return(ctx, outcome, single, blocked_as)
         })
     })
+}
+
+/// Puts a hook's "ask" to the user at the permission prompt. `None` when
+/// the user allows the call, otherwise the reason it is refused. With no
+/// prompt to ask (headless, tests) the call is refused, as
+/// `spawn_headless_ask_responder` refuses a tool's own ask. "Allow
+/// always" allows this call only: hooks do not read permission rules, so
+/// the next matching call asks again.
+async fn confirm(
+    ask: Option<&AskSender>,
+    claude_name: &str,
+    input: &Value,
+    reason: &str,
+) -> Option<String> {
+    let unavailable =
+        || format!("{reason} (confirmation required, but no permission prompt is available)");
+    let Some(ask) = ask else {
+        return Some(unavailable());
+    };
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let request = AskRequest {
+        tool: claude_name.to_string(),
+        input: ask_input(input),
+        details: Some(input.to_string()),
+        reason: Some(format!("{} hook: {reason}", HookEvent::PreToolUse)),
+        reply,
+    };
+    if ask.send(request).await.is_err() {
+        return Some(unavailable());
+    }
+    match answer.await {
+        Ok(UserDecision::AllowOnce | UserDecision::AllowAlways(_)) => None,
+        Ok(UserDecision::Deny { note: Some(note) }) => {
+            Some(format!("{reason}; the user denied it: {note}"))
+        }
+        Ok(UserDecision::Deny { note: None }) => Some(format!("{reason}; the user denied it")),
+        Err(_) => Some(unavailable()),
+    }
+}
+
+/// The line a hook's ask shows as the call's input: the field that says
+/// what the call does, else the whole input.
+fn ask_input(input: &Value) -> String {
+    ["command", "file_path", "url", "path", "pattern"]
+        .iter()
+        .find_map(|key| input.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| input.to_string())
 }
 
 fn pre_tool_return(
@@ -311,23 +373,15 @@ pub fn with_subagent_context(
     )
 }
 
-/// The prompt the model receives after `UserPromptSubmit`: context is
-/// prepended; a block replaces the prompt with a refusal notice.
-pub fn submitted_prompt(hooks: &CommandHooks, session_id: Option<&str>, prompt: String) -> String {
+/// `UserPromptSubmit` for `prompt`: the text the model receives, or the
+/// reason it must not be called at all. See [`policy::submission`].
+pub fn submitted_prompt(
+    hooks: &CommandHooks,
+    session_id: Option<&str>,
+    prompt: String,
+) -> Submission {
     let outcome = hooks.user_prompt_submit(session_id, &prompt);
-    if let Some(reason) = outcome.block {
-        return format!(
-            "<system-reminder>\nThe user's prompt was blocked by a UserPromptSubmit hook and must not be acted on. \
-             Tell the user it was blocked and why.\nReason: {reason}\n</system-reminder>"
-        );
-    }
-    match outcome.context_text() {
-        Some(text) => format!(
-            "{}\n\n{prompt}",
-            system_reminder(HookEvent::UserPromptSubmit, &text)
-        ),
-        None => prompt,
-    }
+    policy::submission(outcome, prompt)
 }
 
 /// `agent_type` reported for dirge's `task` subagents.

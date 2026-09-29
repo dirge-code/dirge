@@ -4,6 +4,7 @@
 //! Each file exports `pub(crate)` function(s); `mod.rs` in parent `slash/`
 //! delegates to them via one-line match arms.
 
+pub(crate) mod addons;
 pub(crate) mod agent;
 pub(crate) mod allow;
 #[cfg(feature = "dap")]
@@ -32,7 +33,7 @@ pub(crate) mod mcp;
 pub(crate) mod memory;
 pub(crate) mod mode;
 pub(crate) mod model;
-pub(crate) mod panel;
+pub(crate) mod msg;
 pub(crate) mod plan;
 pub(crate) mod plugins;
 pub(crate) mod quit;
@@ -43,6 +44,7 @@ pub(crate) mod tasks;
 pub(crate) mod toggle;
 pub(crate) mod tree;
 pub(crate) mod undo;
+pub(crate) mod view;
 #[cfg(feature = "git-worktree")]
 pub(crate) mod worktree;
 #[cfg(feature = "git-worktree")]

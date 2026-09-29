@@ -45,6 +45,9 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Ctrl+C / Esc | Interrupt running agent (also clears queued interjections) |
 | Type while running | Queues your message; runs after the current turn finishes. The runner also stops at the next tool-result boundary so the message is picked up quickly instead of waiting for the whole multi-turn run. Status line shows `q:N` for pending count. |
 | Alt+X | Drop all queued interjections (without cancelling the running agent) |
+| Alt+. / Alt+, | Ask the external panel producer for its next / previous view (see [panel-feed.md](panel-feed.md#replies)); same as `/panel next` / `/panel prev` |
+| Alt+/ | Ask the external panel producer to repaint (`/panel refresh`) |
+| Alt+S | Open or close the swarm grid: every external panel and running subagent at full size (`/swarm`; see [panel-feed.md](panel-feed.md#swarm-grid)) |
 | Ctrl+K | Kill subagent on focused chat tab |
 | Ctrl+X | Close active chat window |
 | Ctrl+N / Ctrl+P | Switch to next/previous chat window (when multiple subagent chats exist) |

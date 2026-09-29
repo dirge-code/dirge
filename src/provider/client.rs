@@ -1839,7 +1839,7 @@ mod tests {
         assert!(codex.is_codex());
         // Defaulted OpenAI id -> Codex default; explicit gpt-6 preserved
         // (dirge-ovjk); a non-default name is untouched.
-        assert_eq!(resolve_model_name(&codex, "gpt-6", false), "gpt-5.5");
+        assert_eq!(resolve_model_name(&codex, "gpt-6", false), "gpt-6-sol");
         assert_eq!(resolve_model_name(&codex, "gpt-6", true), "gpt-6");
         assert_eq!(resolve_model_name(&codex, "o3", false), "o3");
 

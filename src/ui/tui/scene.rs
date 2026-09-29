@@ -61,6 +61,8 @@ pub struct Scene<'a> {
     pub left_info: &'a LeftPanelInfo,
     /// Left panel: subagent status rows (used when non-empty).
     pub subagents: &'a [SubagentStatusRow],
+    /// Left panel: externally-driven panels, painted above AGENTS.
+    pub external_panels: &'a crate::ui::panels_ext::ExternalPanels,
     /// Avatar face spec.
     pub avatar: Option<AvatarSpec<'a>>,
     /// Bottom strip body — editor input or overlay.
@@ -88,6 +90,13 @@ pub struct Scene<'a> {
     /// Brief tooltip text shown in the chat area (e.g. "Copied!").
     /// Empty string means no tooltip.
     pub tooltip: &'a str,
+    /// Open swarm view: when set, the external panels are painted as a
+    /// full-size grid over everything above the input strip (chat and
+    /// both side panels), instead of the compact left-panel boxes.
+    pub swarm: Option<&'a crate::ui::swarm::SwarmView>,
+    /// In-flight subagents painted as grid cells after the external
+    /// panels while the swarm view is open.
+    pub swarm_agents: &'a [crate::ui::swarm::SwarmAgent],
 }
 
 /// Paint the entire UI into `f`. Computes layout from the frame's
@@ -114,13 +123,62 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     );
     let frame_style = Style::default().fg(crossterm_to_ratatui(scene.frame_color));
 
+    if let Some(view) = scene.swarm {
+        // Swarm view: the grid takes every row above the input strip
+        // (top frame through the chat's bottom frame).
+        let grid_h = layout.chat_bot_frame.y.saturating_add(1).min(area.height);
+        f.render_widget(
+            super::swarm::SwarmGrid::new(scene.external_panels, view)
+                .agents(scene.swarm_agents)
+                .border_style(frame_style),
+            ratatui::layout::Rect::new(area.x, area.y, area.width, grid_h),
+        );
+    } else {
+        paint_chat_and_panels(scene, f, &layout, frame_style);
+    }
+
+    // Bottom strip (avatar + input box / overlay + status).
+    let mut strip = BottomStrip::new(&layout)
+        .status(scene.status)
+        .border_style(frame_style)
+        .body(scene.body);
+    if let Some(avatar) = &scene.avatar {
+        strip = strip.avatar(AvatarSpec {
+            face: avatar.face,
+            color: avatar.color,
+        });
+    }
+    f.render_widget(strip, area);
+
+    // Picker overlay (file completion / rewind list), painted over the bottom
+    // rows of the chat content area, just above the input box. Rendered here
+    // (after the chat + strip, before the bg fill) so it overlays chat content
+    // and still inherits the theme background fill below [dirge-92em]. The
+    // swarm grid owns that area while it is open.
+    if scene.swarm.is_none()
+        && let Some(picker) = scene.picker
+    {
+        paint_picker_overlay(f, &layout, picker);
+    }
+
+    finish_frame(scene, f, &layout);
+}
+
+/// Top frame, left panel, chat and right panel: everything above the
+/// input strip when the swarm grid is closed.
+fn paint_chat_and_panels(scene: &Scene, f: &mut Frame<'_>, layout: &Layout, frame_style: Style) {
+    let area = f.area();
+    let layout = *layout;
+
     // Top frame (full width, across left panel + chat + right panel).
     f.render_widget(TopFrame::new(&layout).style(frame_style), area);
 
     // Left panel — idle card or subagent list. Skip on narrow terminals.
     if scene.show_left_panel && layout.left_panel.width >= LEFT_PANEL_MIN_W {
         f.render_widget(
-            LeftPanel::new(scene.left_info, scene.subagents).border_style(frame_style),
+            LeftPanel::new(scene.left_info, scene.subagents)
+                .external_panels(scene.external_panels)
+                .border_style(frame_style),
             layout.left_panel,
         );
     }
@@ -163,27 +221,13 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
 
     // Chat bottom frame (╰───╯ in chat band only).
     f.render_widget(ChatBotFrame::new(&layout).style(frame_style), area);
+}
 
-    // Bottom strip (avatar + input box / overlay + status).
-    let mut strip = BottomStrip::new(&layout)
-        .status(scene.status)
-        .border_style(frame_style)
-        .body(scene.body);
-    if let Some(avatar) = &scene.avatar {
-        strip = strip.avatar(AvatarSpec {
-            face: avatar.face,
-            color: avatar.color,
-        });
-    }
-    f.render_widget(strip, area);
-
-    // Picker overlay (file completion / rewind list) — painted over the bottom
-    // rows of the chat content area, just above the input box. Rendered here
-    // (after the chat + strip, before the bg fill) so it overlays chat content
-    // and still inherits the theme background fill below [dirge-92em].
-    if let Some(picker) = scene.picker {
-        paint_picker_overlay(f, &layout, picker);
-    }
+/// Last paint steps shared by both views: background fills, the
+/// hardware cursor, and the `--no-color` pass.
+fn finish_frame(scene: &Scene, f: &mut Frame<'_>, layout: &Layout) {
+    let area = f.area();
+    let layout = *layout;
 
     // Theme background fill. Every widget above sets foreground only (selection
     // uses the REVERSED modifier, never an explicit bg), so patching the whole
@@ -213,13 +257,15 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     }
 
     // Show the hardware cursor at the editor's (row, col). The
-    // terminal blinks it naturally.
+    // terminal blinks it naturally. Hidden while the swarm grid is open:
+    // keys go to the grid then, not the editor.
     if let BottomBody::Editor {
         cursor_row,
         cursor_col,
         is_running,
         ..
     } = scene.body
+        && scene.swarm.is_none()
     {
         // Must match `paint_editor_box`'s prompt zone (2 cells idle,
         // 3 while running) so the cursor sits on the painted text.
@@ -341,6 +387,10 @@ fn paint_picker_overlay(
 // `BottomBody` is Copy so `render_frame` can pass it to BottomStrip
 // directly without a clone helper.
 
+/// Empty external panel set for scenes that have none.
+pub static NO_EXTERNAL_PANELS: crate::ui::panels_ext::ExternalPanels =
+    crate::ui::panels_ext::ExternalPanels::new();
+
 /// Single empty editor row, used as the default `rows` slice when
 /// no input has been typed yet.
 #[allow(dead_code)]
@@ -368,6 +418,7 @@ pub fn empty_scene<'a>(
         modified_offset: 0,
         left_info,
         subagents,
+        external_panels: &NO_EXTERNAL_PANELS,
         avatar: None,
         body: BottomBody::Editor {
             rows: EMPTY_ROWS,
@@ -385,6 +436,8 @@ pub fn empty_scene<'a>(
         input_bg: crossterm::style::Color::Reset,
         picker: None,
         tooltip: "",
+        swarm: None,
+        swarm_agents: &[],
     }
 }
 
@@ -397,6 +450,57 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// The swarm view replaces the chat and both side panels with the
+    /// panel grid; the input strip and status row stay.
+    #[test]
+    fn swarm_view_paints_the_grid_above_the_input_strip() {
+        use crate::ui::panels_ext::{ExternalPanels, PanelFace, PanelLine, PanelOp};
+        let mut ext = ExternalPanels::default();
+        for (id, title) in [("t1", "Tab one"), ("t2", "Tab two")] {
+            ext.apply(PanelOp::Show {
+                id: id.into(),
+                title: title.into(),
+                lines: vec![PanelLine::new(format!("{id} body"), PanelFace::Normal)],
+            });
+        }
+        let view = crate::ui::swarm::SwarmView::new();
+        let buf: Vec<LineEntry> = Vec::new();
+        let pd = PanelData::default();
+        let info = LeftPanelInfo::default();
+        let subs: Vec<SubagentStatusRow> = Vec::new();
+        let mut scene = empty_scene(&buf, &pd, &info, &subs, "ready");
+        scene.external_panels = &ext;
+        scene.swarm = Some(&view);
+
+        let (w, h) = (80, 16);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render_frame(&scene, f)).unwrap();
+        let rows: Vec<String> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let text = rows.join("\n");
+        assert!(rows[0].contains("SWARM · 2 panels"), "{text}");
+        assert!(!rows[0].contains("[AGENT LOG STREAM]"), "{text}");
+        assert!(
+            rows[1].contains("Tab one") && rows[1].contains("Tab two"),
+            "{text}"
+        );
+        assert!(
+            text.contains("t1 body") && text.contains("t2 body"),
+            "{text}"
+        );
+        let layout = Layout::new(w, h, 1);
+        assert!(rows[layout.status.y as usize].contains("ready"), "{text}");
+        // The grid ends at the chat's bottom frame row; the input box's
+        // top border is still painted below it.
+        let input_top = &rows[layout.input_box.y as usize];
+        assert!(input_top.contains('╭'), "{text}");
+    }
 
     /// End-to-end render: empty buffer, no overlay, defaults.
     /// Verifies the top frame title shows up and the chat band
@@ -622,6 +726,7 @@ mod tests {
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,
+            external_panels: &NO_EXTERNAL_PANELS,
             avatar: None,
             body: BottomBody::Overlay {
                 title: "[ALERT]",
@@ -636,6 +741,8 @@ mod tests {
             input_bg: crossterm::style::Color::Reset,
             picker: None,
             tooltip: "",
+            swarm: None,
+            swarm_agents: &[],
         };
 
         let mut backend = TestBackend::new(160, 30);
@@ -990,6 +1097,7 @@ mod tests {
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,
+            external_panels: &NO_EXTERNAL_PANELS,
             avatar: None,
             body: BottomBody::Editor {
                 rows: EMPTY_ROWS,
@@ -1007,6 +1115,8 @@ mod tests {
             input_bg: crossterm::style::Color::Reset,
             picker: None,
             tooltip: "",
+            swarm: None,
+            swarm_agents: &[],
         };
         terminal.draw(|f| render_frame(&s1, f)).unwrap();
 
@@ -1024,6 +1134,7 @@ mod tests {
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,
+            external_panels: &NO_EXTERNAL_PANELS,
             avatar: None,
             body: BottomBody::Editor {
                 rows: &hello_rows,
@@ -1041,6 +1152,8 @@ mod tests {
             input_bg: crossterm::style::Color::Reset,
             picker: None,
             tooltip: "",
+            swarm: None,
+            swarm_agents: &[],
         };
         terminal.draw(|f| render_frame(&s2, f)).unwrap();
         backend = terminal.backend().clone();

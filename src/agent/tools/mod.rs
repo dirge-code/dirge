@@ -32,6 +32,7 @@ mod session_search;
 mod skill;
 pub(crate) mod snapshots;
 mod spec;
+pub mod subagent_digest;
 pub mod task;
 mod task_status;
 pub(crate) mod text_io;

@@ -7,13 +7,14 @@ use tokio::process::{ChildStderr, Command};
 use tokio::sync::{Mutex, RwLock};
 
 use super::config::McpServerConfig;
+use super::notify::McpClientHandler;
 
 /// A live MCP running service plus the process-group guard that SIGKILLs
 /// its child's whole subtree on drop (dirge-wupp). Bundled in one `Option`
 /// so the guard drops in lockstep with the `RunningService` — on reconnect
 /// (`replace`) and shutdown alike — without a second field to keep in sync.
 type Connection = (
-    RunningService<RoleClient, ()>,
+    RunningService<RoleClient, McpClientHandler>,
     Option<crate::child_guard::ProcessGroupGuard>,
 );
 
@@ -51,7 +52,7 @@ impl SharedConnection {
     pub(crate) fn new(
         server_name: String,
         peer: Peer<RoleClient>,
-        rs: RunningService<RoleClient, ()>,
+        rs: RunningService<RoleClient, McpClientHandler>,
         pg_guard: Option<crate::child_guard::ProcessGroupGuard>,
     ) -> Self {
         Self {
@@ -73,7 +74,7 @@ impl SharedConnection {
     pub async fn replace(
         &self,
         new_peer: Peer<RoleClient>,
-        new_rs: RunningService<RoleClient, ()>,
+        new_rs: RunningService<RoleClient, McpClientHandler>,
         new_guard: Option<crate::child_guard::ProcessGroupGuard>,
     ) {
         // Order: take running_service first (Option swap), then peer
@@ -153,7 +154,7 @@ pub async fn raw_connect(
     config: &McpServerConfig,
 ) -> anyhow::Result<(
     Peer<RoleClient>,
-    RunningService<RoleClient, ()>,
+    RunningService<RoleClient, McpClientHandler>,
     Option<crate::child_guard::ProcessGroupGuard>,
 )> {
     match config {
@@ -188,7 +189,8 @@ pub async fn raw_connect(
             if let Some(child_stderr) = stderr {
                 spawn_stderr_forwarder(server_name.to_string(), child_stderr);
             }
-            let rs = serve_client((), transport)
+            let handler = McpClientHandler::for_server(server_name);
+            let rs = serve_client(handler, transport)
                 .await
                 .map_err(|e| anyhow::anyhow!("MCP connection failed for '{server_name}': {e}"))?;
             let peer = rs.peer().clone();
@@ -204,7 +206,8 @@ pub async fn raw_connect(
                 .custom_headers(custom_headers);
             type HttpClient = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
             let transport = HttpClient::from_config(cfg);
-            let rs = serve_client((), transport).await.map_err(|e| {
+            let handler = McpClientHandler::for_server(server_name);
+            let rs = serve_client(handler, transport).await.map_err(|e| {
                 anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
             })?;
             let peer = rs.peer().clone();

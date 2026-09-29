@@ -1,0 +1,4 @@
+{:addon/id      "echo"
+ :addon/init-ns "echo.addon"
+ :addon/init-fn "addon-ctor"
+ :addon/config  {:greeting "hi"}}

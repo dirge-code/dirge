@@ -221,6 +221,10 @@ pub(crate) struct UiState {
     /// Unconditional so the select! arm can be (select! rejects `#[cfg]` arms);
     /// stays `None` in non-worktree builds.
     pub(crate) wt_merge_phase: Option<crate::ui::wt_merge_phase::WtMergePhaseHandle>,
+    /// In-flight addon command or `/addons reload` (on a blocking thread);
+    /// the `addon_phase` arm lands its result. Stays `None` without the
+    /// `addons` feature.
+    pub(crate) addon_phase: Option<crate::ui::addon_phase::AddonPhaseHandle>,
 
     // ── PTY-backed interactive shell session (!cmd / !!cmd) ──────────
     /// A live PTY-backed shell session for `!cmd` / `!!cmd` (no terminal
@@ -247,8 +251,8 @@ pub(crate) struct UiState {
     pub(crate) subagent_chat_map: HashMap<String, usize>,
     /// chat tab index → task_id (reverse, for Ctrl+K kill).
     pub(crate) chat_idx_to_subagent: HashMap<usize, String>,
-    /// Left-panel subagent rows: id → agent name (for the `[AGENTS]` box).
-    pub(crate) subagent_panel_rows: IndexMap<String, Option<String>>,
+    /// Left-panel subagent rows: id → live status (for the `[AGENTS]` box).
+    pub(crate) subagent_panel_rows: IndexMap<String, crate::ui::agent_io::SubagentLive>,
     /// Recent tool-name ticker (left panel), capped at [`TOOL_ACTIVITY_CAP`].
     pub(crate) tool_activity: VecDeque<String>,
 
@@ -461,6 +465,7 @@ impl UiState {
             review_phase: None,
             btw_phase: None,
             wt_merge_phase: None,
+            addon_phase: None,
             shell_session: None,
             shell_parser: None,
             shell_box_visible: false,

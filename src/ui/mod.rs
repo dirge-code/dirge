@@ -1,3 +1,4 @@
+pub(crate) mod addon_phase;
 mod agent_io;
 pub(crate) mod ansi;
 pub(crate) mod avatar;
@@ -24,6 +25,7 @@ pub(crate) mod memory_review;
 pub(crate) mod notifications;
 pub(crate) mod panel_data;
 mod panel_render;
+pub(crate) mod panels_ext;
 pub(crate) mod permission_ui;
 pub(crate) mod phase;
 pub(crate) mod picker;
@@ -45,6 +47,7 @@ mod state;
 mod status;
 #[cfg(feature = "plugin")]
 mod streaming;
+pub(crate) mod swarm;
 pub(crate) mod sysload;
 pub(crate) mod terminal;
 mod text_output;
@@ -55,6 +58,7 @@ mod tree;
 /// legacy `renderer` module during the staged migration; see beads
 /// dirge-a3x..dirge-eu3 for the phase plan.
 mod tui;
+pub(crate) mod view;
 mod wrap;
 pub(crate) mod wt_merge_phase;
 
@@ -688,6 +692,38 @@ pub async fn run_interactive(
                 ui.is_running = false;
             }
         };
+    }
+
+    // Start a streamed turn on a prompt a slash command or an addon job
+    // handed back: record it, spawn the runner and install it.
+    macro_rules! start_prompt_turn {
+        ($prompt:expr) => {{
+            let run_text: String = $prompt;
+            ui.last_user_prompt = run_text.clone();
+            let history = crate::agent::runner::convert_history(session);
+            session.add_message(MessageRole::User, &run_text);
+            let runner = agent.clone().spawn_runner(
+                crate::provider::Prompt::text(
+                    crate::agent::tools::background::prepend_pending_notifications(
+                        &run_text,
+                        bg_store.as_ref(),
+                    ),
+                ),
+                history,
+                Some(ui.interjection_queue.clone()),
+                Some(session.assets_dir()),
+            );
+            runner.install_into(
+                &mut ui.agent_rx,
+                &mut ui.agent_abort,
+                &mut ui.agent_interject,
+                &mut ui.agent_cancel,
+                &mut ui.is_running,
+            );
+            begin_snapshot_turn(session);
+            // dirge-vpma.18: a run is active, so not the resting face.
+            renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
+        }};
     }
 
     // #387: the render effect. Builds the StatusLine ONCE from the model
@@ -1610,6 +1646,20 @@ pub async fn run_interactive(
     // the UI loop's `tokio::select!`. Review #1.
     let mut notify_rx = crate::ui::notifications::take_receiver();
 
+    // External panel ops (`ui::panels_ext`). The channel is created on
+    // first use, so producers that fired before this point have their
+    // ops queued and drained on the first iterations below.
+    let mut panel_rx = crate::ui::panels_ext::take_receiver();
+    // Optional external panel feed (`panel_feed` config, off by
+    // default). The handle lives for the whole loop; dropping it on
+    // any exit path stops the subscription task.
+    let _panel_feed = crate::extras::panel_feed::start(cfg.panel_feed.as_ref());
+    // View engine (`ui::view`): the view commands and the swarm grid run
+    // off this loop and apart from the agent. Updates arrive on `view_rx`;
+    // the latest model decides locally which keys and commands it owns.
+    let (view_tx, mut view_rx) = mpsc::unbounded_channel::<crate::ui::view::ViewUpdate>();
+    let mut view_model = crate::ui::view::start(view_tx);
+
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<UserEvent>();
     input_reader::spawn_input_reader(user_tx.clone());
 
@@ -2018,6 +2068,26 @@ pub async fn run_interactive(
                                 // sequence would yank). The bound action still dispatches
                                 // through the normal `action` path.
                                 let from_sequence = seq_action.is_some();
+                                // Swarm grid open (per the view model): its
+                                // keys go to the view engine, the editor below
+                                // stays inert, other global commands and
+                                // Ctrl+C pass through. Decided from the model
+                                // alone; the loop never waits on the engine.
+                                if !from_sequence && view_model.swarm_open() {
+                                    use crate::ui::view::promote::{KeyRoute, grid_event, route_key};
+                                    match route_key(&view_model, &key, action) {
+                                        KeyRoute::Grid(name) => {
+                                            crate::ui::view::submit(grid_event(
+                                                name,
+                                                renderer.swarm_cells(),
+                                                renderer.swarm_grid_columns(),
+                                            ));
+                                            continue;
+                                        }
+                                        KeyRoute::Swallow => continue,
+                                        KeyRoute::PassThrough => {}
+                                    }
+                                }
                                 let is_ctrl_c = !from_sequence
                                     && key.code == KeyCode::Char('c')
                                     && key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2075,6 +2145,11 @@ pub async fn run_interactive(
                                         }
                                         // dirge-iagk: and an in-flight `/wt-merge`.
                                         if let Some(ph) = ui.wt_merge_phase.take() {
+                                            ph.core.task.abort();
+                                        }
+                                        // And stop waiting on an addon command or
+                                        // `/addons reload`.
+                                        if let Some(ph) = ui.addon_phase.take() {
                                             ph.core.task.abort();
                                         }
                                         // dirge-vpma.21: and a `!`/`!!` shell run.
@@ -2225,6 +2300,10 @@ pub async fn run_interactive(
                                     }
                                     // dirge-iagk: and an in-flight `/wt-merge`.
                                     if let Some(ph) = ui.wt_merge_phase.take() {
+                                        ph.core.task.abort();
+                                    }
+                                    // And an addon command or `/addons reload`.
+                                    if let Some(ph) = ui.addon_phase.take() {
                                         ph.core.task.abort();
                                     }
                                     if let Some(tx) = ui.agent_cancel.take() {
@@ -2532,6 +2611,7 @@ pub async fn run_interactive(
                                             &mut ui.chat_idx_to_subagent,
                                             old_active,
                                         );
+                                        push_subagent_rows(&ui, &mut renderer);
                                         load_chat_ui_state(
                                             &mut ui.chat_ui_states[renderer.active_chat()],
                                             &mut ui.response_buf,
@@ -2656,6 +2736,30 @@ pub async fn run_interactive(
                                         // mouse / native-scrollback wheel).
                                         renderer.force_terminal_reassert();
                                         renderer.request_repaint();
+                                        continue;
+                                    }
+                                    Some(
+                                        a @ (KeyAction::PanelNextTab
+                                        | KeyAction::PanelPrevTab
+                                        | KeyAction::PanelRefresh),
+                                    ) => {
+                                        // Reply to the external panel producer; a
+                                        // failure arrives as a notification.
+                                        crate::extras::panel_feed::spawn_reply(match a {
+                                            KeyAction::PanelNextTab => {
+                                                crate::extras::panel_feed::ReplyAction::NextTab
+                                            }
+                                            KeyAction::PanelPrevTab => {
+                                                crate::extras::panel_feed::ReplyAction::PrevTab
+                                            }
+                                            _ => crate::extras::panel_feed::ReplyAction::Refresh,
+                                        });
+                                        continue;
+                                    }
+                                    Some(KeyAction::ToggleSwarm) => {
+                                        // Full-screen grid of the external
+                                        // panels; the view engine toggles it.
+                                        crate::ui::view::submit(crate::ui::view::ViewEvent::command("swarm", &[]));
                                         continue;
                                     }
                                     _ => {}
@@ -2808,6 +2912,30 @@ pub async fn run_interactive(
                                     ui.expand_target = crate::ui::state::ExpandTarget::None;
                                     ui.expansion_anchor = None;
                                     ui.live_thinking_expanded = false;
+                                    // Input typed on a subagent's tab goes to that
+                                    // subagent, not the main agent: it is queued as
+                                    // steering for its next turn boundary. Slash
+                                    // commands still run normally.
+                                    if !text.starts_with('/') {
+                                        let active = renderer.active_chat();
+                                        if let Some(sub_id) = ui.chat_idx_to_subagent.get(&active).cloned() {
+                                            use crate::agent::tools::task::{MessageOutcome, message_subagent};
+                                            let note = match message_subagent(&sub_id, &text) {
+                                                MessageOutcome::Queued(_) => {
+                                                    let _ = renderer.write_line_to_chat(
+                                                        active,
+                                                        &format!("<you> {text}"),
+                                                        c_agent(),
+                                                    );
+                                                    "(queued — delivered at the subagent's next turn boundary)"
+                                                }
+                                                _ => "(subagent is not running or has no tools — message not delivered)",
+                                            };
+                                            let _ = renderer.write_line_to_chat(active, note, theme::dim());
+                                            renderer.request_repaint();
+                                            continue;
+                                        }
+                                    }
                                     #[cfg(feature = "loop")]
                                     if loop_state.as_ref().is_some_and(|ls| ls.active) && !text.starts_with('/') {
                                         // Queue the message instead of dropping it.
@@ -2923,6 +3051,19 @@ pub async fn run_interactive(
                                         // The echo below still shows what the user typed.
                                         let expanded =
                                             crate::ui::slash::aliases::expand_alias(&text, &aliases);
+                                        // View commands (`ui::view`) change
+                                        // only what is shown: they go to the
+                                        // view engine, never through the busy
+                                        // gate, and never wait on the agent.
+                                        if let Some(event) =
+                                            crate::ui::view::promote::view_command(&view_model, &expanded)
+                                        {
+                                            write_user_lines(&mut renderer, &text)?;
+                                            renderer.write_line("", Color::White)?;
+                                            crate::ui::view::submit(event);
+                                            renderer.request_repaint();
+                                            continue;
+                                        }
                                         // dirge-nfa: read-only inspection
                                         // commands run during agent activity.
                                         // The busy gate ONLY blocks commands
@@ -3137,23 +3278,21 @@ pub async fn run_interactive(
                                                 // slots (agent_rx/is_running/select!), so we
                                                 // launch the streamed turn here — the same
                                                 // control-flow channel as DEFER_COMPRESS.
-                                                let run_text = prompt;
-        if !run_text.is_empty() {
-                                                    ui.last_user_prompt = run_text.clone();
-                                                    let history =
-                                                        crate::agent::runner::convert_history(session);
-                                                    session.add_message(MessageRole::User, &run_text);
-                                                    let runner = agent.clone().spawn_runner(
-                                                        crate::provider::Prompt::text(crate::agent::tools::background::prepend_pending_notifications(&run_text, bg_store.as_ref())),
-                                                        history,
-                                                        Some(ui.interjection_queue.clone()),
-                                                        Some(session.assets_dir()),
-                                                    );
-                                                    runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
-                                                    begin_snapshot_turn(session);
-                                                    // dirge-vpma.18: a run is active — do not paint the resting face.
-                                                    renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
+        if !prompt.is_empty() {
+                                                    start_prompt_turn!(prompt);
                                                 }
+                                            }
+                                            #[cfg(feature = "addons")]
+                                            Ok(SlashOutcome::DeferAddon(job)) => {
+                                                // The job runs on a blocking thread; the
+                                                // `addon_phase` arm lands its result. The loop
+                                                // stays live meanwhile, so a permission prompt
+                                                // the job raises can be answered, and Ctrl+C
+                                                // stops waiting for it. `is_running` makes the
+                                                // busy gate refuse a second job meanwhile.
+                                                ui.addon_phase = Some(crate::ui::addon_phase::spawn(job));
+                                                ui.is_running = true;
+                                                renderer.set_avatar_state(avatar::AvatarState::Thinking);
                                             }
                                             Err(e) => {
                                                 if e.downcast_ref::<std::io::Error>().is_some_and(|e: &std::io::Error| e.kind() == std::io::ErrorKind::Interrupted) {
@@ -4533,6 +4672,54 @@ pub async fn run_interactive(
                         renderer.set_avatar_state(avatar::AvatarState::Idle);
                         renderer.request_repaint();
                     }
+                    // An addon command or `/addons reload` finished on its blocking
+                    // thread: show its lines, apply a reload's tools to the live agent,
+                    // then start the turn a command asked for or drain what was typed
+                    // meanwhile. Arm is unconditional (select! rejects `#[cfg]` arms);
+                    // the field is always `None` without the `addons` feature.
+                    addon_done = async {
+                        if let Some(ph) = &mut ui.addon_phase {
+                            ph.core.rx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        let _ = ui.addon_phase.take();
+                        #[cfg(feature = "addons")]
+                        {
+                            let landing = crate::ui::addon_phase::land(
+                                addon_done, &mut agent, &permission, &ask_tx,
+                            );
+                            for line in &landing.lines {
+                                renderer.write_line(&line.text, line.tone.color())?;
+                            }
+                            match landing.prompt {
+                                Some(prompt) if !prompt.is_empty() => start_prompt_turn!(prompt),
+                                _ => drain_interjections!(),
+                            }
+                        }
+                        #[cfg(not(feature = "addons"))]
+                        let _ = addon_done;
+                        renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
+                        renderer.request_repaint();
+                    }
+                    // The addons changed in place (a REPL evaluation or
+                    // `dirge.harness/refresh!`): the live agent takes their tools as
+                    // they are now. Unconditional arm; never ready without `addons`.
+                    _ = crate::ui::addon_phase::live_change() => {
+                        #[cfg(feature = "addons")]
+                        {
+                            let landing = crate::ui::addon_phase::land_live(
+                                &mut agent, &permission, &ask_tx,
+                            );
+                            for line in &landing.lines {
+                                renderer.write_line(&line.text, line.tone.color())?;
+                            }
+                            if !landing.lines.is_empty() {
+                                renderer.request_repaint();
+                            }
+                        }
+                    }
                     Some(ask_req) = async {
                         if let Some(rx) = &mut ask_rx {
                             rx.recv().await
@@ -4750,6 +4937,54 @@ pub async fn run_interactive(
                         )?;
                         renderer.request_repaint();
                     }
+                    Some(update) = view_rx.recv() => {
+                        // The view engine answered (`ui::view`): mirror
+                        // its model and carry out its effects. Nothing
+                        // here touches the agent, so this runs mid-turn.
+                        let applied = crate::ui::view::boundary::apply(&mut renderer, &update);
+                        for (line, color) in applied.lines {
+                            write_outside_chamber(
+                                &mut renderer,
+                                &mut ui.last_tool_name,
+                                &mut ui.tool_chamber_open,
+                                &mut ui.chamber_top_start,
+                                &mut ui.chamber_top_end,
+                                &line,
+                                color,
+                            )?;
+                        }
+                        // Effects on state only this loop owns: the
+                        // chat tabs and the editor.
+                        for handoff in applied.handoffs {
+                            use crate::ui::view::boundary::Handoff;
+                            match handoff {
+                                Handoff::OpenAgent(id) => {
+                                    if let Some(&idx) = ui.subagent_chat_map.get(&id) {
+                                        switch_to_chat(&mut ui, &mut renderer, idx);
+                                    }
+                                }
+                                Handoff::MessageAgent(id) => {
+                                    input.set_text(&format!("/msg {id} "));
+                                }
+                            }
+                        }
+                        view_model = update.model;
+                        renderer.request_repaint();
+                    }
+                    Some(panel_op) = async {
+                        if let Some(rx) = &mut panel_rx {
+                            rx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        // External panel update: fold it into the
+                        // left-panel state. The reducer sanitises and
+                        // bounds producer text; the loop-top paint
+                        // shows the result.
+                        renderer.apply_external_panel_op(panel_op);
+                        renderer.request_repaint();
+                    }
                     Some(lifecycle_evt) = async {
                         if let Some(rx) = &mut lifecycle_rx {
                             rx.recv().await
@@ -4833,12 +5068,13 @@ pub async fn run_interactive(
                             agent.extend_loop_tools(tools);
                             // #701: re-publish the live agent so `current_agent()`
                             // (what a tooled `task(agent=…)` subagent forks off)
-                            // reflects the just-injected MCP tools + their names.
+                            // and the `call-tool` registry (plugins and addons)
+                            // reflect the just-injected MCP tools + their names.
                             // Without this the background-loaded MCP tools reach
                             // the main loop (via `agent.clone()` per prompt) but
-                            // NOT subagents, whose snapshot would stay pre-MCP
-                            // until the next rebuild (/model, /agent, /cd, …).
-                            crate::provider::set_current_agent(std::sync::Arc::new(agent.clone()));
+                            // NOT subagents or `call-tool`, whose snapshots would
+                            // stay pre-MCP until the next rebuild (/model, /cd, …).
+                            crate::provider::publish_live_agent(&agent);
                             mcp_manager = Some(mgr);
                             mcp_ready_rx = None;
                             tracing::info!("MCP ready: injected {n} tool(s) into the live agent");
@@ -5019,15 +5255,7 @@ pub async fn run_interactive(
                         // Trigger a viewport repaint so the gutter
                         // refreshes without waiting for the next chat
                         // event / keystroke.
-                        let panel_rows: Vec<crate::ui::renderer::SubagentStatusRow> =
-                            ui.subagent_panel_rows
-                                .iter()
-                                .map(|(id, agent)| crate::ui::renderer::SubagentStatusRow {
-                                    id_short: id.chars().take(6).collect(),
-                                    agent: agent.clone(),
-                                })
-                                .collect();
-                        renderer.set_subagent_status(panel_rows);
+                        push_subagent_rows(&ui, &mut renderer);
                         renderer.request_repaint();
 
                         // dirge-9xo: auto-resume the parent agent when a
@@ -5292,11 +5520,18 @@ pub async fn run_interactive(
     // path the connected manager is owned here (delivered by the
     // background loader), so we close its child processes on the way out
     // rather than relying on drop. `None` when MCP never finished
-    // connecting (or there were no servers) — nothing to do.
-    #[cfg(feature = "mcp")]
-    if let Some(mgr) = mcp_manager.take() {
-        mgr.shutdown().await;
-    }
+    // connecting (or there were no servers), nothing to do. The session
+    // ends first, while its listeners can still reach MCP.
+    crate::agent::session_lifecycle::end_then(
+        crate::agent::session_lifecycle::EndCause::Quit,
+        async {
+            #[cfg(feature = "mcp")]
+            if let Some(mgr) = mcp_manager.take() {
+                mgr.shutdown().await;
+            }
+        },
+    )
+    .await;
 
     Ok(())
 }
@@ -5649,6 +5884,68 @@ fn rect_contains_xy(rect: Option<ratatui::layout::Rect>, row: u16, col: u16) -> 
 fn modified_visible_rows(rect: Option<ratatui::layout::Rect>) -> usize {
     rect.map(|r| (r.height as usize).saturating_sub(2).saturating_sub(1))
         .unwrap_or(0)
+}
+
+/// Push the live subagent rows to the renderer: the `[AGENTS]` box and
+/// the swarm grid's subagent cells (with the chat tab each streams into).
+fn push_subagent_rows(ui: &state::UiState, renderer: &mut Renderer) {
+    let (rows, agents) = ui
+        .subagent_panel_rows
+        .iter()
+        .map(|(id, live)| {
+            let row = live.status_row(id);
+            let cell = crate::ui::swarm::SwarmAgent {
+                id: id.clone(),
+                chat_idx: ui.subagent_chat_map.get(id).copied(),
+                row: row.clone(),
+                tail: Vec::new(),
+            };
+            (row, cell)
+        })
+        .unzip();
+    renderer.set_subagent_status(rows);
+    renderer.set_swarm_agents(agents);
+}
+
+/// Make chat tab `idx` the active one, carrying the per-chat UI state
+/// across the switch the way Ctrl+N/P does.
+fn switch_to_chat(ui: &mut state::UiState, renderer: &mut Renderer, idx: usize) {
+    let old_active = renderer.active_chat();
+    if idx == old_active || idx >= renderer.chat_count() {
+        return;
+    }
+    save_chat_ui_state(
+        &mut ui.chat_ui_states[old_active],
+        &mut ui.response_buf,
+        &mut ui.response_start_line,
+        &mut ui.reasoning_buf,
+        &mut ui.reasoning_start_line,
+        &mut ui.last_tool_name,
+        &mut ui.last_tool_call_id,
+        &mut ui.tool_chamber_open,
+        &mut ui.agent_line_started,
+        &mut ui.was_reasoning,
+        &mut ui.tool_calls_buf,
+        &mut ui.tool_calls_this_run,
+    );
+    renderer.switch_chat(idx);
+    load_chat_ui_state(
+        &mut ui.chat_ui_states[idx],
+        &mut ui.response_buf,
+        &mut ui.response_start_line,
+        &mut ui.reasoning_buf,
+        &mut ui.reasoning_start_line,
+        &mut ui.last_tool_name,
+        &mut ui.last_tool_call_id,
+        &mut ui.tool_chamber_open,
+        &mut ui.agent_line_started,
+        &mut ui.was_reasoning,
+        &mut ui.tool_calls_buf,
+        &mut ui.tool_calls_this_run,
+    );
+    // The expansion anchor indexes the old chat's buffer.
+    ui.expansion_anchor = None;
+    ui.live_thinking_expanded = false;
 }
 
 /// dirge-vpma.8: after a chat at index `removed` is closed, chat indices

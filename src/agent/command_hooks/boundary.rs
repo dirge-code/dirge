@@ -4,6 +4,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::domain::{Exited, HookCommand, HookError};
@@ -74,6 +75,62 @@ impl HookRunner for ShellRunner {
             stderr,
         })
     }
+}
+
+/// Where `type: "addon"` entries go, looked up at each call: the addon host
+/// starts after the hook registry is built, and may be replaced by a reload.
+pub type AddonRunnerSlot = Arc<dyn Fn() -> Option<Arc<dyn HookRunner>> + Send + Sync>;
+
+/// Adapter: each entry to the runner its `type` names. `command` entries to
+/// `shell`; `addon` entries to whatever `addon` yields, failing open (no
+/// verdict, action allowed) when nothing answers them.
+pub struct DispatchRunner {
+    shell: Arc<dyn HookRunner>,
+    addon: AddonRunnerSlot,
+}
+
+impl DispatchRunner {
+    pub fn new(shell: Arc<dyn HookRunner>, addon: AddonRunnerSlot) -> Self {
+        Self { shell, addon }
+    }
+
+    /// `ShellRunner` for commands, the process-wide addon runner for addons.
+    pub fn live() -> Self {
+        Self::new(Arc::new(ShellRunner), Arc::new(installed_addon_runner))
+    }
+}
+
+impl HookRunner for DispatchRunner {
+    fn run(
+        &self,
+        cmd: &HookCommand,
+        payload: &str,
+        project_dir: &Path,
+    ) -> Result<Exited, HookError> {
+        if cmd.addon_target().is_none() {
+            return self.shell.run(cmd, payload, project_dir);
+        }
+        match (self.addon)() {
+            Some(runner) => runner.run(cmd, payload, project_dir),
+            None => Err(HookError::SpawnFailed(
+                "no addon host is running to answer this hook".to_string(),
+            )),
+        }
+    }
+}
+
+static ADDON_RUNNER: OnceLock<Arc<dyn HookRunner>> = OnceLock::new();
+
+/// Make `runner` the one that answers `type: "addon"` entries in this
+/// process. The first install wins.
+#[cfg_attr(not(feature = "addons"), allow(dead_code))]
+pub fn install_addon_runner(runner: Arc<dyn HookRunner>) {
+    let _ = ADDON_RUNNER.set(runner);
+}
+
+/// The addon runner of this process, once one is installed.
+pub fn installed_addon_runner() -> Option<Arc<dyn HookRunner>> {
+    ADDON_RUNNER.get().cloned()
 }
 
 fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<String> {

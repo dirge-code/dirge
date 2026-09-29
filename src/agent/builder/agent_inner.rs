@@ -157,11 +157,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // `Err(_) => None` branch (and now bounding how long a stuck DB can
     // wedge `/prompt <name>`).
     let paths_for_mem = paths.clone();
-    let memory_load_result: Result<crate::extras::memory_db::SqliteMemoryStore, String> =
-        spawn_blocking_with_timeout(DB_LOAD_TIMEOUT, move || {
-            crate::extras::memory_db::SqliteMemoryStore::load(&paths_for_mem)
-        })
-        .await;
+    let project_cfg = cfg.memory_config();
+    let memory_load_result = spawn_blocking_with_timeout(DB_LOAD_TIMEOUT, move || {
+        crate::extras::memory_provider::build(
+            &project_cfg,
+            crate::extras::memory_provider::MemoryScope::Project(&paths_for_mem),
+            crate::extras::memory_provider::Retrieval::Plain,
+        )
+    })
+    .await;
     // dirge-fmau: route the preamble snapshot through the
     // `MemoryProvider` trait so a non-default backend's prompt block
     // appears too. The unsizing coercion from `Arc<MemoryToolStore>`
@@ -176,9 +180,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // hybrid — route such callers through the tool instead.
     let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
         match memory_load_result {
-            Ok(store) => {
-                let provider: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
-                    Arc::new(store);
+            Ok(provider) => {
                 append_memory_to_preamble(&mut preamble, &provider);
                 Some(provider)
             }
@@ -205,14 +207,16 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // distinct header, so durable user preferences reach the prompt
     // regardless of which project this is. Best-effort: a load failure just
     // omits the global block.
-    if let Ok(global) = spawn_blocking_with_timeout(
-        DB_LOAD_TIMEOUT,
-        crate::extras::memory_db::SqliteMemoryStore::load_global,
-    )
+    let global_cfg = cfg.memory_config();
+    if let Ok(global_provider) = spawn_blocking_with_timeout(DB_LOAD_TIMEOUT, move || {
+        crate::extras::memory_provider::build(
+            &global_cfg,
+            crate::extras::memory_provider::MemoryScope::Global,
+            crate::extras::memory_provider::Retrieval::Plain,
+        )
+    })
     .await
     {
-        let global_provider: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
-            Arc::new(global);
         crate::agent::builder::preamble::append_global_memory_to_preamble(
             &mut preamble,
             &global_provider,
