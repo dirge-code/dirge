@@ -299,6 +299,51 @@ pub(crate) fn resolve_anthropic_auth_with_expiry() -> anyhow::Result<RefreshedAu
     )
 }
 
+/// Recover from a server-rejected bearer even when its recorded expiry is in
+/// the future. Claude may have rotated the shared credentials file since this
+/// client was built; adopt that token first. Otherwise refresh once under the
+/// same file lock used by normal expiry renewal.
+pub(crate) fn recover_anthropic_auth_after_unauthorized(
+    rejected: &str,
+) -> anyhow::Result<Option<RefreshedAuth>> {
+    if std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok_and(|v| !v.trim().is_empty()) {
+        // An exported token has no refresh grant owned by Dirge.
+        return Ok(None);
+    }
+    recover_anthropic_auth_after_unauthorized_from(anthropic_credentials_file_path(), rejected)
+        .map(Some)
+}
+
+fn recover_anthropic_auth_after_unauthorized_from(
+    path: PathBuf,
+    rejected: &str,
+) -> anyhow::Result<RefreshedAuth> {
+    let _lock = crate::auth::file_lock::FileLock::acquire_for(&path);
+    let raw = std::fs::read_to_string(&path)?;
+    let json: serde_json::Value = serde_json::from_str(&raw)?;
+    let current =
+        extract_string_by_keys(&json, &["accessToken", "access_token"]).ok_or_else(|| {
+            anyhow::anyhow!("Claude OAuth access token is missing; run `dirge auth anthropic`")
+        })?;
+    let expires_at_ms = extract_i64_by_keys(&json, &["expiresAt", "expires_at", "expires"]);
+    if current != rejected && !anthropic_token_is_expired(&json) {
+        return Ok(RefreshedAuth {
+            bearer_token: current,
+            expires_at_ms,
+        });
+    }
+    let refresh =
+        extract_string_by_keys(&json, &["refreshToken", "refresh_token"]).ok_or_else(|| {
+            anyhow::anyhow!("Claude OAuth refresh token is missing; run `dirge auth anthropic`")
+        })?;
+    let fresh = refresh_anthropic_token_sync(&refresh)?;
+    crate::provider::anthropic_oauth::persist_credentials(&fresh)?;
+    Ok(RefreshedAuth {
+        bearer_token: fresh.access_token,
+        expires_at_ms: Some(fresh.expires_at),
+    })
+}
+
 fn resolve_anthropic_auth_with_expiry_from(
     oauth_token: Option<String>,
     credentials_file_path: PathBuf,
@@ -662,6 +707,31 @@ mod tests {
         assert_eq!(headers.bearer_token, "sk-ant-oat-file");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejected_bearer_adopts_a_token_rotated_by_claude() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-anthropic-rotated-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        let expires = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        std::fs::write(
+            &path,
+            serde_json::json!({"claudeAiOauth": {
+                "accessToken": "sk-ant-oat-new",
+                "refreshToken": "unused",
+                "expiresAt": expires
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let fresh = recover_anthropic_auth_after_unauthorized_from(path, "sk-ant-oat-old").unwrap();
+        assert_eq!(fresh.bearer_token, "sk-ant-oat-new");
+        assert_eq!(fresh.expires_at_ms, Some(expires));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     // ── Kimi auth resolution ────────────────────────────────────────────

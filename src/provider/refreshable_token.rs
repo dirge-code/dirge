@@ -40,6 +40,8 @@ use crate::provider::auth::RefreshedAuth;
 /// mid-session. Boxed so tests can inject a fake; the live seams wrap
 /// the per-provider `load_fresh_*` helpers, which refresh and persist.
 pub(crate) type RefreshFn = Arc<dyn Fn() -> anyhow::Result<RefreshedAuth> + Send + Sync>;
+pub(crate) type RejectionRefreshFn =
+    Arc<dyn Fn(&str) -> anyhow::Result<Option<RefreshedAuth>> + Send + Sync>;
 
 struct TokenState {
     bearer: String,
@@ -51,6 +53,7 @@ struct TokenState {
 pub(crate) struct RefreshableToken {
     state: Mutex<TokenState>,
     refresher: RefreshFn,
+    rejection_refresher: Option<RejectionRefreshFn>,
     /// Renew this many ms BEFORE the token actually dies (dirge-iki5).
     ///
     /// Per-provider on purpose. Kimi runs a margin because a 15-minute
@@ -75,6 +78,7 @@ impl RefreshableToken {
                 expires_at_ms: None,
             }),
             refresher: Arc::new(|| Err(anyhow::anyhow!("this bearer cannot be refreshed"))),
+            rejection_refresher: None,
             margin_ms: 0,
             provider: "unknown",
         }
@@ -93,6 +97,7 @@ impl RefreshableToken {
                 expires_at_ms,
             }),
             refresher,
+            rejection_refresher: None,
             margin_ms,
             provider,
         }
@@ -149,6 +154,50 @@ impl RefreshableToken {
         }
         state.bearer.clone()
     }
+
+    pub(crate) fn with_rejection_refresh(mut self, refresher: RejectionRefreshFn) -> Self {
+        self.rejection_refresher = Some(refresher);
+        self
+    }
+
+    /// A 401 can precede local expiry when Claude rotates the shared token.
+    /// Re-check under the lock so concurrent failed requests trigger one
+    /// recovery, then retry only if the bearer actually changed.
+    fn recover_rejected_blocking(&self, rejected: &str) -> Option<String> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.bearer != rejected {
+            return Some(state.bearer.clone());
+        }
+        let recover = self.rejection_refresher.as_ref()?;
+        match recover(rejected) {
+            Ok(Some(fresh)) if fresh.bearer_token != rejected => {
+                state.bearer = fresh.bearer_token;
+                state.expires_at_ms = fresh.expires_at_ms;
+                Some(state.bearer.clone())
+            }
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "dirge::provider",
+                    provider = %self.provider,
+                    error = %error,
+                    "OAuth bearer rejected and recovery failed; run `dirge auth anthropic`",
+                );
+                None
+            }
+        }
+    }
+}
+
+pub(crate) async fn recover_rejected(
+    token: Option<Arc<RefreshableToken>>,
+    rejected: String,
+) -> Option<String> {
+    let token = token?;
+    tokio::task::spawn_blocking(move || token.recover_rejected_blocking(&rejected))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Resolve the bearer for one request without blocking the runtime.
@@ -290,6 +339,39 @@ mod tests {
             bearer(Some(Arc::new(token))).await.as_deref(),
             Some("static")
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_bearer_recovers_only_once_across_repeated_rejections() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let token = Arc::new(
+            RefreshableToken::renewable(
+                "old".to_string(),
+                in_ms(3_600_000),
+                Arc::new(|| unreachable!()),
+                0,
+                "anthropic",
+            )
+            .with_rejection_refresh(Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(RefreshedAuth {
+                    bearer_token: "new".to_string(),
+                    expires_at_ms: in_ms(3_600_000),
+                }))
+            })),
+        );
+        assert_eq!(
+            recover_rejected(Some(token.clone()), "old".into())
+                .await
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            recover_rejected(Some(token), "old".into()).await.as_deref(),
+            Some("new")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

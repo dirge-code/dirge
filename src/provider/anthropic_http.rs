@@ -70,13 +70,18 @@ impl AnthropicHttpClient {
     ) -> Self {
         Self {
             inner: reqwest::Client::new(),
-            token: Some(Arc::new(RefreshableToken::renewable(
-                bearer_token,
-                expires_at_ms,
-                refresher,
-                REFRESH_MARGIN_MS,
-                "anthropic",
-            ))),
+            token: Some(Arc::new(
+                RefreshableToken::renewable(
+                    bearer_token,
+                    expires_at_ms,
+                    refresher,
+                    REFRESH_MARGIN_MS,
+                    "anthropic",
+                )
+                .with_rejection_refresh(Arc::new(
+                    super::auth::recover_anthropic_auth_after_unauthorized,
+                )),
+            )),
         }
     }
 
@@ -139,6 +144,31 @@ impl AnthropicHttpClient {
     }
 }
 
+fn clone_request(req: &Request<Bytes>) -> http_client::Result<Request<Bytes>> {
+    let mut builder = Request::builder()
+        .method(req.method().clone())
+        .uri(req.uri().clone())
+        .version(req.version());
+    if let Some(headers) = builder.headers_mut() {
+        *headers = req.headers().clone();
+    }
+    builder
+        .body(req.body().clone())
+        .map_err(http_client::Error::Protocol)
+}
+
+fn replace_bearer(req: &mut Request<Bytes>, bearer: &str) -> http_client::Result<()> {
+    let value = http::HeaderValue::from_str(&format!("Bearer {bearer}"))
+        .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
+    req.headers_mut().insert(http::header::AUTHORIZATION, value);
+    Ok(())
+}
+
+fn unauthorized<T>(result: &http_client::Result<T>) -> bool {
+    matches!(result, Err(http_client::Error::InvalidStatusCodeWithMessage(status, _))
+        if *status == http::StatusCode::UNAUTHORIZED)
+}
+
 /// An Anthropic OAuth access token (as opposed to an `sk-ant-api…` API key)
 /// is identified by the `sk-ant-oat` marker; only OAuth traffic gets the
 /// Claude Code payload shaping.
@@ -163,8 +193,18 @@ impl HttpClientExt for AnthropicHttpClient {
         // conversion is the only step that needs `T`, so it happens here.
         let req: Request<Bytes> = req.map(Into::into);
         async move {
-            let req = Self::normalized_request(req, refreshable_token::bearer(token).await)?;
-            inner.send(req).await
+            let bearer = refreshable_token::bearer(token.clone()).await;
+            let req = Self::normalized_request(req, bearer.clone())?;
+            let mut retry = clone_request(&req)?;
+            let result = inner.send(req).await;
+            if unauthorized(&result)
+                && let Some(rejected) = bearer
+                && let Some(fresh) = refreshable_token::recover_rejected(token, rejected).await
+            {
+                replace_bearer(&mut retry, &fresh)?;
+                return inner.send(retry).await;
+            }
+            result
         }
     }
 
@@ -185,14 +225,11 @@ impl HttpClientExt for AnthropicHttpClient {
     where
         T: Into<Bytes> + Send,
     {
-        let inner = self.inner.clone();
-        let token = self.token.clone();
-        // `T` is not `'static`, and the returned future is; the body
-        // conversion is the only step that needs `T`, so it happens here.
         let req: Request<Bytes> = req.map(Into::into);
         async move {
-            let req = Self::normalized_request(req, refreshable_token::bearer(token).await)?;
-            inner.send_streaming(req).await
+            super::compressing_http::StreamingWithHeaders::send_streaming_with_headers(self, req)
+                .await
+                .result
         }
     }
 }
@@ -213,9 +250,35 @@ impl super::compressing_http::StreamingWithHeaders for AnthropicHttpClient {
         let token = self.token.clone();
         let req: Request<Bytes> = req.map(Into::into);
         async move {
-            let req = Self::normalized_request(req, refreshable_token::bearer(token).await);
+            let bearer = refreshable_token::bearer(token.clone()).await;
+            let req = Self::normalized_request(req, bearer.clone());
             match req {
-                Ok(req) => inner.send_streaming_with_headers(req).await,
+                Ok(req) => {
+                    let mut retry = match clone_request(&req) {
+                        Ok(retry) => retry,
+                        Err(error) => {
+                            return StreamingSend {
+                                result: Err(error),
+                                headers: None,
+                            };
+                        }
+                    };
+                    let result = inner.send_streaming_with_headers(req).await;
+                    if unauthorized(&result.result)
+                        && let Some(rejected) = bearer
+                        && let Some(fresh) =
+                            refreshable_token::recover_rejected(token, rejected).await
+                    {
+                        if let Err(error) = replace_bearer(&mut retry, &fresh) {
+                            return StreamingSend {
+                                result: Err(error),
+                                headers: None,
+                            };
+                        }
+                        return inner.send_streaming_with_headers(retry).await;
+                    }
+                    result
+                }
                 // A normalization failure never reached the network, so there
                 // is no response and no headers to keep.
                 Err(e) => StreamingSend {
@@ -1015,6 +1078,71 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("0"),
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_oauth_bearer_recovers_and_retries_once() {
+        use super::super::compressing_http::StreamingWithHeaders;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut authorizations = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let size = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..size]);
+                authorizations.push(
+                    request
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                        .unwrap()
+                        .to_string(),
+                );
+                let response = if attempt == 0 {
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            authorizations
+        });
+
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        let calls = recovery_calls.clone();
+        let token = RefreshableToken::renewable(
+            "sk-ant-oat-stale".to_string(),
+            Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
+            Arc::new(|| unreachable!("local expiry is still in the future")),
+            REFRESH_MARGIN_MS,
+            "anthropic",
+        )
+        .with_rejection_refresh(Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(RefreshedAuth {
+                bearer_token: "sk-ant-oat-fresh".to_string(),
+                expires_at_ms: Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
+            }))
+        }));
+        let client = AnthropicHttpClient {
+            inner: reqwest::Client::new(),
+            token: Some(Arc::new(token)),
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/v1/messages"))
+            .body(Bytes::from_static(b"{}"))
+            .unwrap();
+        let sent = client.send_streaming_with_headers(req).await;
+        assert!(sent.result.is_ok(), "retry must succeed");
+        assert_eq!(recovery_calls.load(Ordering::SeqCst), 1);
+        let headers = server.await.unwrap();
+        assert_eq!(headers.len(), 2);
+        assert!(headers[0].ends_with("Bearer sk-ant-oat-stale"));
+        assert!(headers[1].ends_with("Bearer sk-ant-oat-fresh"));
     }
 
     /// The OAuth bearer the shaping tests normalize against. Passed
