@@ -117,7 +117,14 @@ impl RefreshableToken {
     /// The bearer when no renewal is due. `None` is the caller's cue to
     /// go off-thread, and it is the only path that can block.
     fn if_fresh(&self) -> Option<String> {
-        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        // A rejected-token recovery can hold this lock during network I/O.
+        // Never wait for it on dirge's single runtime thread; the slow path
+        // below waits on the blocking pool instead.
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
         if self.renewal_due(&state) {
             return None;
         }
@@ -372,6 +379,13 @@ mod tests {
             Some("new")
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_locked_token_never_blocks_the_runtime_fast_path() {
+        let token = RefreshableToken::fixed("static".to_string());
+        let _held_by_recovery = token.state.lock().unwrap();
+        assert_eq!(token.if_fresh(), None);
     }
 
     #[tokio::test]
