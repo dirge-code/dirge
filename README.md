@@ -335,6 +335,7 @@ authorization, delete the `auth.json` file and log in again.
 | `/mcp` | List MCP servers and tools (only present in builds with the `mcp` feature) |
 | `/kill [id]` | Kill the subagent on the focused chat tab (also `Ctrl+K`) |
 | `/panel [on\|off\|auto\|debug]` | Toggle both side panels together — left: session vitals (context gauge, recent activity, git); right: system load, MCP, LSP, todos, modified files. `auto` shows them at ≥152 cols; `debug` forces the layout-debug view. |
+| `/swarm [on\|off]` | Open or close the swarm grid: every external panel (see [docs/panel-feed.md](docs/panel-feed.md#swarm-grid)) and every running subagent painted at full size over the chat, with keys that reply to the producer, open a subagent's tab or message it (also `Alt+S`) |
 | `/display <panes>` | Choose which panes show, e.g. `/display main`, `/display main\|right`, `/display left\|main\|right`. The main pane is always shown; left/right toggle independently. Set a default with the `display` config key. |
 | `/allow [list\|add\|remove\|clear]` | Manage the session permission allowlist; bare `/allow` lists it. See [docs/permissions.md](docs/permissions.md#allow-always-and-the-session-allowlist) |
 | `/why <tool> [input]` | Dry-run a permission decision and print the full policy trace |

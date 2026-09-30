@@ -1850,3 +1850,154 @@ fn set_reasoning_round_trips_through_getter() {
     agent.set_reasoning(None);
     assert_eq!(agent.reasoning(), None);
 }
+
+/// Loop tool with a name and an optional runtime source; `execute` is never
+/// called.
+#[derive(Debug)]
+struct SourcedTool(&'static str, Option<&'static str>);
+
+impl crate::agent::agent_loop::LoopTool for SourcedTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "test"
+    }
+    fn label(&self) -> &str {
+        "test"
+    }
+    fn parameters(&self) -> &serde_json::Value {
+        static EMPTY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+    }
+    fn source(&self) -> Option<&str> {
+        self.1
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        _args: serde_json::Value,
+        _signal: crate::agent::agent_loop::tool::AbortSignal,
+        _on_update: crate::agent::agent_loop::tool::LoopToolUpdate,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::agent::agent_loop::LoopToolResult, String>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(crate::agent::agent_loop::LoopToolResult::default()) })
+    }
+}
+
+fn names(agent: &AnyAgent) -> Vec<&str> {
+    agent.loop_tools.iter().map(|t| t.name()).collect()
+}
+
+/// `/addons reload` swaps a source's tools in the live agent: its old tools
+/// go, its new ones come, everything else stays.
+#[test]
+fn upsert_replaces_only_the_sources_own_tools() {
+    use std::sync::Arc;
+
+    let mut agent = build_openai_any_agent();
+    agent.loop_tools = vec![
+        Arc::new(SourcedTool("read", None)),
+        Arc::new(SourcedTool("old_addon_tool", Some("addon"))),
+    ];
+    let installed = agent.upsert_loop_tools(
+        "addon",
+        vec![
+            Arc::new(SourcedTool("new_addon_tool", Some("addon"))),
+            Arc::new(SourcedTool("other_addon_tool", Some("addon"))),
+        ],
+    );
+    assert_eq!(installed, vec!["new_addon_tool", "other_addon_tool"]);
+    assert_eq!(
+        names(&agent),
+        vec!["read", "new_addon_tool", "other_addon_tool"]
+    );
+
+    assert_eq!(
+        agent.remove_loop_tools_by_source("addon"),
+        vec!["new_addon_tool", "other_addon_tool"]
+    );
+    assert_eq!(names(&agent), vec!["read"]);
+}
+
+/// A runtime source can never shadow a built-in (or any other source's)
+/// tool name.
+#[test]
+fn upsert_never_shadows_another_sources_tool() {
+    use std::sync::Arc;
+
+    let mut agent = build_openai_any_agent();
+    agent.loop_tools = vec![Arc::new(SourcedTool("bash", None))];
+    let installed = agent.upsert_loop_tools(
+        "addon",
+        vec![
+            Arc::new(SourcedTool("bash", Some("addon"))),
+            Arc::new(SourcedTool("dup", Some("addon"))),
+            Arc::new(SourcedTool("dup", Some("addon"))),
+        ],
+    );
+    assert_eq!(installed, vec!["dup"]);
+    assert_eq!(names(&agent), vec!["bash", "dup"]);
+    assert_eq!(
+        agent.loop_tools[0].source(),
+        None,
+        "the built-in kept its slot"
+    );
+}
+
+/// A compiled-in built-in's name stays reserved even when this agent does
+/// not carry that built-in, as it is at boot.
+#[test]
+fn upsert_never_takes_a_reserved_builtin_name() {
+    use std::sync::Arc;
+
+    let mut agent = build_openai_any_agent();
+    agent.loop_tools = vec![Arc::new(SourcedTool("read", None))];
+    let installed = agent.upsert_loop_tools(
+        "addon",
+        vec![
+            Arc::new(SourcedTool("bash", Some("addon"))),
+            Arc::new(SourcedTool("count_rows", Some("addon"))),
+        ],
+    );
+    assert_eq!(installed, vec!["count_rows"]);
+    assert_eq!(names(&agent), vec!["read", "count_rows"]);
+}
+
+/// Under dynamic tool search, replaced tools leave the searchable registry
+/// and new ones join it, still search-gated.
+#[test]
+fn upsert_keeps_the_search_registry_in_step() {
+    use crate::agent::tools::tool_search::{ToolMeta, meta_from_loop_tool};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    let filter: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let registry: Arc<Mutex<Vec<ToolMeta>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut agent =
+        build_openai_any_agent().with_dynamic_tool_search(filter.clone(), registry.clone());
+    let read = SourcedTool("read", None);
+    let old = SourcedTool("old_addon_tool", Some("addon"));
+    registry
+        .lock()
+        .unwrap()
+        .extend([meta_from_loop_tool(&read), meta_from_loop_tool(&old)]);
+    agent.loop_tools = vec![Arc::new(read), Arc::new(old)];
+
+    agent.upsert_loop_tools("addon", vec![Arc::new(SourcedTool("fresh", Some("addon")))]);
+
+    let listed: Vec<String> = registry
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.name.clone())
+        .collect();
+    assert_eq!(listed, vec!["read", "fresh"]);
+    assert!(filter.lock().unwrap().is_empty(), "nothing force-loaded");
+}

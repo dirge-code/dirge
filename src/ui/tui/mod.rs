@@ -20,3 +20,4 @@ pub mod frame;
 pub mod layout;
 pub mod panels;
 pub mod scene;
+pub mod swarm;

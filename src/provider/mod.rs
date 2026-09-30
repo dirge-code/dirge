@@ -53,6 +53,15 @@ pub fn current_agent() -> Option<std::sync::Arc<AnyAgent>> {
     CURRENT_AGENT.lock_ignore_poison().clone()
 }
 
+/// Publish `agent` after its tool set changed in place: as the agent
+/// tooled subagents fork from and, with plugins, as the tool set
+/// `call-tool` reaches.
+pub fn publish_live_agent(agent: &AnyAgent) {
+    set_current_agent(std::sync::Arc::new(agent.clone()));
+    #[cfg(feature = "plugin")]
+    crate::plugin::tool_bridge::publish_registry(agent.loop_tools());
+}
+
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use rig::providers::{anthropic, chatgpt, gemini, ollama, openai, openrouter};
@@ -280,6 +289,9 @@ pub struct AnyAgent {
     /// switching this request to API-key billing.
     openai_api_key_fallback_model: Option<AnyModel>,
     api_billing_ask_tx: Option<crate::permission::ask::AskSender>,
+    /// Where a command hook's `PreToolUse` "ask" is put to the user; see
+    /// [`Self::with_hook_ask_tx`].
+    hook_ask_tx: Option<crate::permission::ask::AskSender>,
     /// dirge-ygm3: a memory tool with the background-review actions
     /// (`mark`/`supersede`) enabled, kept OUT of `loop_tools` so the
     /// interactive agent never sees them. The review runner swaps this in
@@ -434,6 +446,7 @@ impl AnyAgent {
             memory_provider: None,
             openai_api_key_fallback_model: None,
             api_billing_ask_tx: None,
+            hook_ask_tx: None,
             review_memory_tool: None,
             mcp_tool_names: std::collections::HashSet::new(),
         }
@@ -497,6 +510,70 @@ impl AnyAgent {
         self.loop_tools.extend(more);
     }
 
+    /// Drop every live tool whose [`LoopTool::source`] is `source`, pruning
+    /// them from the `tool_search` registry too. Returns the names dropped.
+    /// Not feature-gated: any runtime contributor (the addon host today)
+    /// uses it. The next `spawn_runner` sees the smaller set.
+    ///
+    /// [`LoopTool::source`]: crate::agent::agent_loop::LoopTool::source
+    #[cfg_attr(not(feature = "addons"), allow(dead_code))]
+    pub fn remove_loop_tools_by_source(&mut self, source: &str) -> Vec<String> {
+        let (gone, kept): (Vec<_>, Vec<_>) = self
+            .loop_tools
+            .drain(..)
+            .partition(|t| t.source() == Some(source));
+        self.loop_tools = kept;
+        let names: Vec<String> = gone.iter().map(|t| t.name().to_string()).collect();
+        if let Some(registry) = &self.tool_search_registry {
+            let still_live: std::collections::HashSet<&str> =
+                self.loop_tools.iter().map(|t| t.name()).collect();
+            registry
+                .lock_ignore_poison()
+                .retain(|m| still_live.contains(m.name.as_str()) || !names.contains(&m.name));
+        }
+        names
+    }
+
+    /// Replace `source`'s live tools with `tools`. A tool is skipped when a
+    /// built-in compiled into this build reserves its name (whether or not
+    /// this agent carries that built-in) or another source already uses it,
+    /// so a runtime contributor can never shadow built-ins, plugins or MCP
+    /// tools. The same rule filters addon tools when the agent is built.
+    /// When dynamic tool search is on, the new tools join the `tool_search`
+    /// registry and stay search-gated like any other. Returns the names
+    /// installed.
+    #[cfg_attr(not(feature = "addons"), allow(dead_code))]
+    pub fn upsert_loop_tools(
+        &mut self,
+        source: &str,
+        tools: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
+    ) -> Vec<String> {
+        self.remove_loop_tools_by_source(source);
+        let mut taken: std::collections::HashSet<String> = self
+            .loop_tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        let fresh: Vec<_> = tools
+            .into_iter()
+            .filter(|t| {
+                !crate::agent::tools::reserves_builtin_name(t.name())
+                    && taken.insert(t.name().to_string())
+            })
+            .collect();
+        if let Some(registry) = &self.tool_search_registry {
+            let mut reg = registry.lock_ignore_poison();
+            for t in &fresh {
+                reg.push(crate::agent::tools::tool_search::meta_from_loop_tool(
+                    t.as_ref(),
+                ));
+            }
+        }
+        let names = fresh.iter().map(|t| t.name().to_string()).collect();
+        self.loop_tools.extend(fresh);
+        names
+    }
+
     /// dirge-7tvq: install the `MemoryProvider` used for this session
     /// so lifecycle hooks (`on_session_end`, `on_pre_compress`) can
     /// dispatch through the trait. Called by `build_agent` once the
@@ -549,6 +626,16 @@ impl AnyAgent {
     ) -> Self {
         self.openai_api_key_fallback_model = Some(model);
         self.api_billing_ask_tx = ask_tx;
+        self
+    }
+
+    /// The permission prompt a command hook's `PreToolUse` "ask" is put
+    /// to. `None` (headless, tests) makes such an ask refuse the call.
+    pub(crate) fn with_hook_ask_tx(
+        mut self,
+        ask_tx: Option<crate::permission::ask::AskSender>,
+    ) -> Self {
+        self.hook_ask_tx = ask_tx;
         self
     }
 

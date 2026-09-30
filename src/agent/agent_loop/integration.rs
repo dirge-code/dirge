@@ -378,6 +378,12 @@ pub struct LoopSpawnConfig {
     /// new user turns.
     pub steering_queue: Option<Arc<Mutex<VecDeque<String>>>>,
 
+    /// External loop directives (`loop_inbox`): steer items join the
+    /// steering poll, follow-ups the finalization poll, and the run is
+    /// attached so an interjection can end it. Only the main session's
+    /// runs carry one; subagents leave it `None`.
+    pub loop_inbox: Option<Arc<super::loop_inbox::LoopInbox>>,
+
     /// Default tool-execution mode (per-tool overrides win). Pi
     /// defaults to Parallel; existing dirge tools that mutate
     /// shared state (bash, edit, write, apply_patch) should
@@ -559,6 +565,16 @@ pub struct LoopSpawnConfig {
     /// Claude-Code-compatible command hooks for this loop (`PreToolUse`,
     /// `PostToolUse`, and its stop event). `None` installs none.
     pub command_hooks: Option<crate::agent::command_hooks::HookBinding>,
+
+    /// Addons whose tool-call hooks this loop installs. `None` installs
+    /// none; set for the main session only.
+    pub addon_hooks: Option<std::sync::Arc<dyn crate::agent::addon_hooks::AddonHooks>>,
+
+    /// Amends the run's system prompt and first turn inside the run's task,
+    /// before the first model call, so slow work there (addon hooks
+    /// reaching MCP) never runs on the caller's thread. `None` opens the
+    /// run as configured.
+    pub open_run: Option<super::hooks::OpenRunFn>,
 }
 
 impl LoopSpawnConfig {
@@ -580,6 +596,7 @@ impl LoopSpawnConfig {
             #[cfg(feature = "plugin")]
             plugin_mgr: None,
             steering_queue: None,
+            loop_inbox: None,
             tool_execution: ToolExecutionMode::Parallel,
             event_channel_capacity: 256,
             summarize_fn: None,
@@ -614,6 +631,8 @@ impl LoopSpawnConfig {
             bg_store: None,
             memory_provider: None,
             command_hooks: None,
+            addon_hooks: None,
+            open_run: None,
         }
     }
 }
@@ -751,16 +770,15 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             );
             loop_config.should_stop_after_turn =
                 Some(super::plugin_hooks::should_stop_after_turn_from_plugin_manager(pm.clone()));
-            // Compose with caller-provided steering queue: if
-            // BOTH are present, prefer the plugin one (plugin
-            // hooks compose at runtime; the explicit
-            // steering_queue was for legacy / test usage). Real
-            // production wires one or the other.
-            if loop_config.get_steering_messages.is_none() {
-                loop_config.get_steering_messages = Some(
-                    super::plugin_hooks::get_steering_messages_from_plugin_manager(pm.clone()),
-                );
-            }
+            // Compose with the caller's steering queue: the TUI always
+            // passes its interjection queue, so installing the plugin
+            // hook only when none was given left `harness/add-steering`
+            // dead in interactive sessions. Both are polled; the user's
+            // own text first.
+            loop_config.get_steering_messages = Some(super::loop_inbox::chain_steering(
+                loop_config.get_steering_messages.take(),
+                super::plugin_hooks::get_steering_messages_from_plugin_manager(pm.clone()),
+            ));
             // dirge-9tfq: when both plugin AND background-store
             // followups are configured, run both at each boundary and
             // concatenate (background notifications first so the
@@ -784,6 +802,20 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         }
     }
 
+    // External loop directives go after every other source: the user's
+    // own steering and the harness follow-ups keep their priority.
+    let loop_inbox = cfg.loop_inbox.clone();
+    if let Some(inbox) = &loop_inbox {
+        loop_config.get_steering_messages = Some(super::loop_inbox::chain_steering(
+            loop_config.get_steering_messages.take(),
+            inbox.steering_hook(),
+        ));
+        loop_config.get_followup_messages = Some(super::loop_inbox::chain_followups(
+            loop_config.get_followup_messages.take(),
+            inbox.followup_hook(),
+        ));
+    }
+
     if let Some(binding) = &cfg.command_hooks {
         crate::agent::command_hooks::loop_hooks::install(
             &mut loop_config,
@@ -791,6 +823,12 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             cfg.session_id.clone(),
         );
     }
+
+    if let Some(addons) = &cfg.addon_hooks {
+        addons.install_tool_hooks(&mut loop_config);
+    }
+    // The addons also hear the run's events, from the pump below.
+    let addon_observer = cfg.addon_hooks.clone();
 
     let mut context = Context {
         system_prompt: cfg.system_prompt,
@@ -812,26 +850,9 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
     // loop never adds or removes tools mid-run, so one snapshot holds.
     let bridge_tools: std::collections::HashSet<String> =
         context.tools.iter().map(|t| t.name().to_string()).collect();
-    // Seed the active-turn user message from `initial_prompt`, appending
-    // a `UserPart::Image` per fresh-paste image (the resume path carries
-    // its images through history as `dirge-asset:` sentinels instead).
-    let initial_content = {
-        // Drop an empty caption when images are present — a bare
-        // `text("")` ahead of an image serializes to an empty text
-        // content block the provider rejects. Keep it when there are no
-        // images so a genuinely empty turn still has one (text) part.
-        let mut parts = Vec::new();
-        if !cfg.initial_prompt.is_empty() || cfg.initial_prompt_images.is_empty() {
-            parts.push(super::message::UserPart::text(cfg.initial_prompt.clone()));
-        }
-        for img in &cfg.initial_prompt_images {
-            parts.push(super::message::UserPart::image(img.clone()));
-        }
-        parts
-    };
-    let prompts = vec![LoopMessage::User(UserMessage {
-        content: initial_content,
-    })];
+    let initial_prompt = cfg.initial_prompt;
+    let initial_prompt_images = cfg.initial_prompt_images;
+    let open_run = cfg.open_run;
     let stream_fn = cfg.stream_fn;
     let summarize_fn = cfg.summarize_fn.clone();
     // dirge-h5tv: capture the provider before the move-closure so
@@ -863,6 +884,29 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         let (loop_tx, mut loop_rx) = mpsc::channel(256);
         let event_tx_inner = event_tx.clone();
         let signal_inner = signal_for_task.clone();
+        // Attached for the task's whole life, detached when it ends or is
+        // aborted, so an external interjection reaches this run only.
+        let _inbox_run = loop_inbox
+            .as_ref()
+            .map(|inbox| inbox.attach_run(signal_for_task.clone()));
+
+        // Open the run here, on the agent runtime: what amends the opening
+        // may wait on addon code and MCP servers, which the caller's thread
+        // must not.
+        let initial_text = match open_run {
+            Some(open) => {
+                let opening = open(super::hooks::RunOpening {
+                    system_prompt: std::mem::take(&mut context.system_prompt),
+                    prompt: initial_prompt,
+                    reminders: Vec::new(),
+                })
+                .await;
+                context.system_prompt = opening.system_prompt.clone();
+                opening.first_turn_text()
+            }
+            None => initial_prompt,
+        };
+        let prompts = vec![initial_user_message(initial_text, &initial_prompt_images)];
 
         // Heal messages loaded from disk before the first LLM call.
         // Shrinks oversized tool results and drops unpaired tool
@@ -923,6 +967,9 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
                     // splits others, so "did the loop decide this" and "would
                     // the TUI show this twice" need separate answers.
                     super::trace::record_ui_event(&agent_evt);
+                    if let Some(addons) = &addon_observer {
+                        addons.observe(&agent_evt);
+                    }
                     let ends_the_run = super::run_end::is_terminal(&agent_evt);
                     // If the receiver dropped (UI exited),
                     // stop pumping — loop_future continues
@@ -947,6 +994,24 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         task,
         signal,
     }
+}
+
+/// The active-turn user message: `text`, then a `UserPart::Image` per
+/// fresh-paste image (the resume path carries its images through history as
+/// `dirge-asset:` sentinels instead).
+fn initial_user_message(text: String, images: &[super::message::ImageRef]) -> LoopMessage {
+    // Drop an empty caption when images are present: a bare `text("")`
+    // ahead of an image serializes to an empty text content block the
+    // provider rejects. Keep it when there are no images so a genuinely
+    // empty turn still has one (text) part.
+    let mut content = Vec::new();
+    if !text.is_empty() || images.is_empty() {
+        content.push(super::message::UserPart::text(text));
+    }
+    for img in images {
+        content.push(super::message::UserPart::image(img.clone()));
+    }
+    LoopMessage::User(UserMessage { content })
 }
 
 /// Pass-through `convert_to_llm`. Phase 4.5f-2 will substitute a
@@ -1418,6 +1483,149 @@ mod tests {
         );
     }
 
+    /// A loop-inbox directive pushed while the run is mid-turn is steered
+    /// into the very next LLM call, next to the user's own queue, and
+    /// acknowledged; a follow-up keeps a finishing run going for one more
+    /// turn; an interjection ends the run at its boundary.
+    #[tokio::test]
+    async fn loop_inbox_steers_follows_up_and_interjects_a_live_run() {
+        use super::super::loop_inbox::{InjectionAck, LoopDirective, LoopInbox, LoopMode};
+
+        #[derive(Default)]
+        struct Acks(Mutex<Vec<String>>);
+        impl InjectionAck for Acks {
+            fn injected(&self, ids: &[String]) {
+                self.0.lock().unwrap().extend(ids.iter().cloned());
+            }
+        }
+
+        fn user_texts(llm_ctx: &crate::agent::agent_loop::stream::LlmContext) -> Vec<String> {
+            llm_ctx
+                .messages
+                .iter()
+                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                .filter_map(|m| {
+                    m.get("content")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        }
+
+        let inbox = Arc::new(LoopInbox::default());
+        let acks = Arc::new(Acks::default());
+        inbox.set_ack(acks.clone());
+        let queue = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let (inbox_w, queue_w, seen_w) = (inbox.clone(), queue.clone(), seen.clone());
+        let factory: StreamFn = Arc::new(move |llm_ctx, _opts| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            seen_w.lock().unwrap().push(user_texts(&llm_ctx));
+            if n == 0 {
+                queue_w.lock().unwrap().push_back("user says hi".into());
+                inbox_w.push(LoopDirective {
+                    id: "s1".into(),
+                    mode: LoopMode::Steer,
+                    prompt: "[hive sense · ling-1 is blocked]".into(),
+                });
+            }
+            if n == 1 {
+                // About to finish: a completion arrives.
+                inbox_w.push(LoopDirective {
+                    id: "s2".into(),
+                    mode: LoopMode::FollowUp,
+                    prompt: "[hive sense · ling-2 completed]".into(),
+                });
+            }
+            let msg = if n == 0 {
+                tool_response("call-1", "echo", serde_json::json!({}))
+            } else {
+                text_response("ok")
+            };
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: None,
+            }]))
+        });
+
+        let mut cfg = LoopSpawnConfig::minimal(factory, "start");
+        cfg.tools.push(Arc::new(EchoTool));
+        cfg.tool_execution = ToolExecutionMode::Sequential;
+        cfg.steering_queue = Some(queue);
+        cfg.loop_inbox = Some(inbox.clone());
+
+        let runner = spawn_loop_runner(cfg);
+        let _events = drain(runner.event_rx).await;
+        let _ = runner.task.await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            3,
+            "the follow-up bought exactly one more turn: {seen:?}"
+        );
+        let second = seen[1].join("\n---\n");
+        let user_at = second.find("user says hi").expect("user steering injected");
+        let sense_at = second
+            .find("ling-1 is blocked")
+            .expect("sense steered mid-turn");
+        assert!(user_at < sense_at, "the user's own steering goes first");
+        assert!(second.contains("did not come from the user"));
+        assert!(seen[2].iter().any(|t| t.contains("ling-2 completed")));
+        assert_eq!(*acks.0.lock().unwrap(), ["s1", "s2"]);
+        assert!(inbox.is_empty());
+        assert!(!inbox.run_attached(), "the run detached when it ended");
+    }
+
+    /// An interjection pushed mid-run stops the run at its next boundary
+    /// and stays queued to open the next one.
+    #[tokio::test]
+    async fn loop_inbox_interject_ends_the_run_and_waits_for_the_next() {
+        use super::super::loop_inbox::{LoopDirective, LoopInbox, LoopMode};
+
+        let inbox = Arc::new(LoopInbox::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (inbox_w, counter_w) = (inbox.clone(), counter.clone());
+        let factory: StreamFn = Arc::new(move |_llm_ctx, _opts| {
+            let n = counter_w.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                inbox_w.push(LoopDirective {
+                    id: "d".into(),
+                    mode: LoopMode::Interject,
+                    prompt: "[hive sense · ling-3 ran out of context]".into(),
+                });
+            }
+            // Would keep calling tools forever without the interjection.
+            let msg = tool_response(&format!("call-{n}"), "echo", serde_json::json!({}));
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: None,
+            }]))
+        });
+        let mut cfg = LoopSpawnConfig::minimal(factory, "start");
+        cfg.tools.push(Arc::new(EchoTool));
+        cfg.tool_execution = ToolExecutionMode::Sequential;
+        cfg.loop_inbox = Some(inbox.clone());
+        let runner = spawn_loop_runner(cfg);
+        let _events = drain(runner.event_rx).await;
+        let _ = runner.task.await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "stopped at the first boundary"
+        );
+        assert_eq!(
+            inbox.take_for_new_run().as_deref(),
+            Some("[hive sense · ling-3 ran out of context]")
+        );
+    }
+
     /// End-to-end: a tool-shaped task injects few-shot exemplars into
     /// the model-facing context. The mock factory inspects what the LLM
     /// actually received — proving the feature is wired, not just unit-
@@ -1677,6 +1885,41 @@ mod tests {
             .filter(|e| matches!(e, AgentEvent::TurnEnd { .. }))
             .count();
         assert_eq!(turn_ends, 1, "expected single turn; got {turn_ends}");
+    }
+
+    /// The loop installs the tool-call hooks of the addons it is handed.
+    #[tokio::test]
+    async fn the_loop_installs_the_tool_hooks_of_the_addons_it_is_handed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingAddons(AtomicUsize);
+        impl crate::agent::addon_hooks::AddonHooks for CountingAddons {
+            fn loop_tools(
+                &self,
+                _: Option<crate::permission::checker::PermCheck>,
+                _: Option<crate::permission::ask::AskSender>,
+            ) -> Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> {
+                Vec::new()
+            }
+            fn install_tool_hooks(&self, _: &mut crate::agent::agent_loop::types::LoopConfig) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn open_run(
+                &self,
+                _: Option<String>,
+                _: bool,
+            ) -> Option<crate::agent::agent_loop::hooks::OpenRunFn> {
+                None
+            }
+        }
+
+        let addons = Arc::new(CountingAddons(AtomicUsize::new(0)));
+        let mut cfg = LoopSpawnConfig::minimal(canned_factory(vec![text_response("done")]), "hi");
+        cfg.addon_hooks = Some(addons.clone());
+        let runner = spawn_loop_runner(cfg);
+        let _ = drain(runner.event_rx).await;
+        let _ = runner.task.await;
+        assert_eq!(addons.0.load(Ordering::SeqCst), 1);
     }
 
     fn agent_event_kind(e: &AgentEvent) -> &'static str {

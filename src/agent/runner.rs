@@ -56,6 +56,25 @@ impl AgentRunner {
         *cancel = Some(self.cancel_tx);
         *is_running = true;
     }
+
+    /// A runner that ends at once with `message` as its error, without
+    /// calling the model. For a run that must not start, such as a prompt a
+    /// `UserPromptSubmit` hook blocked. Callers see the same shape as any
+    /// failed run, so no spawn site needs a second path.
+    pub(crate) fn refused(message: String) -> AgentRunner {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let (interject_tx, _) = mpsc::channel(1);
+        let (cancel_tx, _) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let _ = event_tx.send(AgentEvent::Error(message.into())).await;
+        });
+        AgentRunner {
+            event_rx,
+            task,
+            interject_tx,
+            cancel_tx,
+        }
+    }
 }
 
 /// Abort-on-drop guard for a forked [`AgentRunner`]. Holding it while draining
@@ -533,6 +552,22 @@ mod plugin_hook_tests {
             is_running,
             "is_running must still be true; no overwrite allowed"
         );
+    }
+
+    /// A refused run reports its reason as the run's only event and then
+    /// closes, so the UI's error path ends it like any failed run.
+    #[tokio::test]
+    async fn refused_runner_reports_the_reason_then_closes() {
+        let mut runner = AgentRunner::refused("blocked: no secrets".to_string());
+        match runner.event_rx.recv().await {
+            Some(AgentEvent::Error(msg)) => assert_eq!(msg.as_str(), "blocked: no secrets"),
+            other => panic!("expected the refusal as an Error event, got {other:?}"),
+        }
+        assert!(
+            runner.event_rx.recv().await.is_none(),
+            "nothing may follow the refusal"
+        );
+        runner.task.await.expect("the refusal task must not panic");
     }
 
     #[test]

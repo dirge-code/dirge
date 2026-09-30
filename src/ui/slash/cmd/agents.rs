@@ -46,13 +46,14 @@ pub(crate) async fn cmd_agents(ctx: &mut SlashCtx<'_>, _parts: &[&str]) -> anyho
         ctx.renderer
             .write_line("usage: /agent <name>  |  /agent off", c_agent())?;
 
-        let roles: [(&str, ConfigRole); 6] = [
+        let roles: [(&str, ConfigRole); 7] = [
             ("review", ConfigRole::Review),
             ("escalation", ConfigRole::Escalation),
             ("summarization", ConfigRole::Summarization),
             ("subagent", ConfigRole::Subagent),
             ("critic", ConfigRole::Critic),
             ("approval", ConfigRole::Approval),
+            ("subagent-digest", ConfigRole::SubagentDigest),
         ];
         let configured: Vec<(&str, String, Option<String>)> = roles
             .iter()
@@ -64,6 +65,7 @@ pub(crate) async fn cmd_agents(ctx: &mut SlashCtx<'_>, _parts: &[&str]) -> anyho
                     ConfigRole::Subagent => ctx.cfg.subagent_provider.is_some(),
                     ConfigRole::Critic => ctx.cfg.critic_provider.is_some(),
                     ConfigRole::Approval => ctx.cfg.approval_provider.is_some(),
+                    ConfigRole::SubagentDigest => ctx.cfg.subagent_digest_provider.is_some(),
                     ConfigRole::Default => true,
                 };
                 if !explicit {

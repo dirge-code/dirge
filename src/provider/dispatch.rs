@@ -19,7 +19,7 @@ use super::anthropic_http::AnthropicHttpClient;
 use super::codex_http::CodexHttpClient;
 use super::summarize;
 
-const OPENAI_CODEX_OAUTH_DEFAULT_MODEL: &str = "gpt-5.5";
+const OPENAI_CODEX_OAUTH_DEFAULT_MODEL: &str = "gpt-6-sol";
 
 pub enum AnyClient {
     OpenRouter(openrouter::Client<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
@@ -232,7 +232,7 @@ mod resolve_model_name_tests {
 
     #[test]
     fn defaulted_openai_id_under_codex_becomes_the_codex_default() {
-        assert_eq!(resolve_codex_default(true, "gpt-6", false), "gpt-5.5");
+        assert_eq!(resolve_codex_default(true, "gpt-6", false), "gpt-6-sol");
     }
 
     #[test]
@@ -288,7 +288,7 @@ mod resolve_model_name_tests {
         // No resumed session: use (requested, requested_explicit).
         assert_eq!(
             resolve_startup_model_for(true, "gpt-6", false, false, None),
-            ("gpt-5.5".to_string(), false)
+            ("gpt-6-sol".to_string(), false)
         );
         assert_eq!(
             resolve_startup_model_for(true, "gpt-6", true, false, None),
@@ -312,7 +312,7 @@ mod resolve_model_name_tests {
         // flag deserializes to false, so it still maps to the Codex default.
         assert_eq!(
             resolve_startup_model_for(true, "gpt-6", false, false, Some(("gpt-6", false))),
-            ("gpt-5.5".to_string(), false)
+            ("gpt-6-sol".to_string(), false)
         );
     }
 

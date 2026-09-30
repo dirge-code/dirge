@@ -43,6 +43,16 @@ pub fn register_alias_commands(cmds: Vec<String>) {
     *ALIAS_COMMANDS.lock_ignore_poison() = cmds;
 }
 
+/// Command names (without leading `/`) Clojure addons registered. Replaced
+/// wholesale at startup and on every `/addons reload`.
+static ADDON_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Register addon command names for tab completion.
+#[cfg(feature = "addons")]
+pub fn register_addon_commands(cmds: Vec<String>) {
+    *ADDON_COMMANDS.lock_ignore_poison() = cmds;
+}
+
 /// All completable slash commands: built-ins + plugin-registered.
 /// Sorted, with leading `/`.
 #[cfg(feature = "slash-completion")]
@@ -60,6 +70,12 @@ pub fn all_commands() -> Vec<String> {
     }
     let alias_guard = ALIAS_COMMANDS.lock_ignore_poison();
     for name in alias_guard.iter() {
+        let with_slash = format!("/{}", name);
+        if !cmds.contains(&with_slash) {
+            cmds.push(with_slash);
+        }
+    }
+    for name in ADDON_COMMANDS.lock_ignore_poison().iter() {
         let with_slash = format!("/{}", name);
         if !cmds.contains(&with_slash) {
             cmds.push(with_slash);
@@ -179,8 +195,14 @@ static SUBCOMMAND_ENTRIES: &[(&str, &[&str])] = &[
             "help",
         ],
     ),
-    ("/panel", &["on", "off", "auto", "debug"]),
+    (
+        "/panel",
+        &[
+            "on", "off", "auto", "debug", "next", "prev", "refresh", "focus", "unfocus",
+        ],
+    ),
     ("/plugins", &["load"]),
+    ("/swarm", &["on", "off"]),
     ("/display", &[]), // dynamic: pane spec
     ("/kill", &[]),    // dynamic: subagent ID
     ("/cd", &[]),      // dynamic: directory path

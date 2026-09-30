@@ -37,6 +37,13 @@ pub struct SubagentStatusRow {
     pub id_short: String,
     /// Agent-profile name (e.g. "architect"); falls back to `id_short` when unset.
     pub agent: Option<String>,
+    /// Latest thing the subagent did (e.g. `read path=src/lib.rs`), painted
+    /// as a dim preview line under the name. `None` until its first event.
+    pub activity: Option<String>,
+    /// Tool calls made so far.
+    pub tool_calls: usize,
+    /// Seconds since spawn, as of the snapshot.
+    pub elapsed_secs: u64,
 }
 
 /// Context-window fill gauge for the left panel's `[CONTEXT]` section.

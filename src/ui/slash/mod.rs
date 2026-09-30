@@ -57,6 +57,10 @@ pub(crate) enum SlashOutcome {
     /// `/wt-exit`: leave the worktree and return to the main repo.
     #[cfg(feature = "git-worktree")]
     DeferWtExit(cmd::wt_defer::WtExit),
+    /// An addon command or `/addons reload`: run the job off the event loop
+    /// and land its result there.
+    #[cfg(feature = "addons")]
+    DeferAddon(crate::ui::addon_phase::AddonJob),
 }
 
 #[cfg(feature = "slash-completion")]
@@ -68,6 +72,9 @@ pub use completion::register_plugin_commands;
 
 #[cfg(feature = "slash-completion")]
 pub use completion::register_alias_commands;
+
+#[cfg(all(feature = "slash-completion", feature = "addons"))]
+pub use completion::register_addon_commands;
 
 #[inline]
 pub(super) fn c_agent() -> Color {
@@ -701,6 +708,7 @@ pub async fn handle_slash(
             });
         }
         "/loop" => cmd::loop_cmd::cmd_loop(&mut ctx, &parts, text).await?,
+        "/addons" => return cmd::addons::cmd_addons(&mut ctx, &parts),
         "/prompt" => return cmd::prompt::cmd_prompt(&mut ctx, &parts).await,
         "/agent" | "/agents" => cmd::agent::cmd_agent(&mut ctx, &parts).await?,
         "/plan" => cmd::plan::cmd_plan(&mut ctx, &parts, text).await?,
@@ -722,8 +730,7 @@ pub async fn handle_slash(
         "/tree" => cmd::tree::cmd_tree(&mut ctx, &parts).await?,
         "/fork" => cmd::fork::cmd_fork(&mut ctx, &parts).await?,
         "/clone" => cmd::clone::cmd_clone(&mut ctx, &parts).await?,
-        "/panel" => cmd::panel::cmd_panel(&mut ctx, &parts).await?,
-        "/display" => cmd::panel::cmd_display(&mut ctx, &parts).await?,
+        "/panel" | "/display" | "/swarm" => cmd::view::cmd_view(&parts),
         "/btw" => return cmd::btw::cmd_btw(&mut ctx, &parts).await,
         "/learn" => return cmd::learn::cmd_learn(&mut ctx, &parts).await,
         "/code-review" => cmd::code_review::cmd_code_review(&mut ctx).await?,
@@ -739,6 +746,7 @@ pub async fn handle_slash(
         "/issues" => cmd::issues::cmd_issues(&mut ctx, &parts).await?,
         "/memory" => cmd::memory::cmd_memory(&mut ctx, &parts).await?,
         "/kill" => cmd::kill::cmd_kill(&mut ctx, &parts).await?,
+        "/msg" => cmd::msg::cmd_msg(&mut ctx, &parts, text).await?,
         #[cfg(unix)]
         "/sandbox" => cmd::sandbox::cmd_sandbox(&mut ctx, &parts).await?,
         #[cfg(feature = "dap")]
@@ -811,6 +819,13 @@ pub async fn handle_slash(
                     return Ok(SlashOutcome::Handled);
                 }
             }
+            // Then commands Clojure addons registered (`:dirge/commands`).
+            #[cfg(feature = "addons")]
+            if let Some(host) = crate::addons::global()
+                && let Some(command) = host.command(parts[0].trim_start_matches('/'))
+            {
+                return Ok(cmd::addons::command_job(host, command, text));
+            }
             ctx.renderer.write_line(
                 &format!("unknown command: {} (try /help)", parts[0]),
                 c_error(),
@@ -846,6 +861,7 @@ fn compress_instructions(parts: &[&str]) -> Option<String> {
 /// feature.
 fn slash_commands() -> Vec<(&'static str, &'static str)> {
     let mut cmds = vec![
+        ("/addons", "list Clojure addons, or reload them in place"),
         ("/agent", "switch to a named agent, or turn agents off"),
         ("/agents", "list available agents"),
         ("/allow", "manage the session permission allowlist"),
@@ -877,6 +893,7 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ("/help", "show this help"),
         ("/issues", "view the native issue board"),
         ("/kill", "kill a running subagent"),
+        ("/msg", "send a message to a running subagent"),
         (
             "/code-review",
             "review the working-tree diff for issues (needs critic_provider)",
@@ -891,7 +908,10 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ),
         ("/mode", "view or set the permission/security mode"),
         ("/model", "list configured models, or switch to one"),
-        ("/panel", "toggle the side panels on or off"),
+        (
+            "/panel",
+            "toggle the side panels; next|prev|refresh|focus <id>|unfocus drive an external panel",
+        ),
         ("/plan", "run the phased plan workflow on a request"),
         ("/plugins", "list or load plugins"),
         ("/prompt", "list, switch, or reset the active prompt layer"),
@@ -909,6 +929,10 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ),
         ("/sessions", "list, switch, or delete saved sessions"),
         ("/spec", "inspect the spec-driven workflow tracker"),
+        (
+            "/swarm",
+            "open or close the full-screen grid of external panels (Alt+S)",
+        ),
         ("/tasks", "list subagent chats and background shells"),
         ("/toggle", "turn a feature (e.g. todo tools) on or off"),
         ("/tree", "show the conversation tree, or switch to a branch"),
@@ -1395,6 +1419,7 @@ mod tests {
             "/regen-prompts",
             "/retry",
             "/sessions",
+            "/swarm",
             "/tasks",
             "/toggle",
             "/tree",
@@ -1426,6 +1451,24 @@ mod tests {
             total,
             "duplicate command name in slash_commands()",
         );
+    }
+
+    /// `/swarm` is dispatched, listed in `/help` and parses its argument
+    /// through the pure `SwarmCmd` parser.
+    #[test]
+    fn swarm_command_is_known_and_parses() {
+        use crate::ui::swarm::SwarmCmd;
+        assert!(is_known_slash_command("/swarm"));
+        assert!(
+            slash_command_descriptions()
+                .iter()
+                .any(|(n, d)| *n == "/swarm" && d.contains("grid"))
+        );
+        let parts = split_command_parts("/swarm off");
+        assert_eq!(parts[0], "/swarm");
+        assert_eq!(SwarmCmd::parse(&parts[1..]), Ok(SwarmCmd::Close));
+        let bare = split_command_parts("/swarm");
+        assert_eq!(SwarmCmd::parse(&bare[1..]), Ok(SwarmCmd::Toggle));
     }
 
     /// dirge-dlpl: `/compact` used to check only the SIZE, so a summarizer

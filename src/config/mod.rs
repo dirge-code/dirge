@@ -479,6 +479,7 @@ pub enum ConfigRole {
     Subagent,
     Critic,
     Approval,
+    SubagentDigest,
 }
 
 /// One VSCode-style key binding: bind a key chord (or chord sequence like
@@ -521,6 +522,89 @@ pub struct MemoryConfig {
     /// review and memory curator forks as well as the agent's own writes.
     /// Default off — it changes long-standing behavior.
     pub confirm_writes: Option<bool>,
+    /// Which backend serves memory. Default `sqlite`, the builtin
+    /// per-project and global stores. `mcp` serves memory from a tool on a
+    /// configured MCP server (see `mcp`). `addon` is reserved: selecting it
+    /// today leaves the session without memory, with a warning, rather than
+    /// silently falling back to `sqlite`.
+    pub provider: Option<MemoryBackend>,
+    /// How `provider: "mcp"` reaches its server: which `mcp_servers` entry,
+    /// and which tool each memory operation calls with which arguments.
+    pub mcp: Option<McpMemoryConfig>,
+}
+
+/// `memory.mcp`: memory served by tools on an MCP server. Nothing here is
+/// specific to one server; the operation table says how each memory
+/// operation becomes a tool call.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpMemoryConfig {
+    /// The name of an entry in `mcp_servers`.
+    pub server: String,
+    /// One entry per memory operation the server can serve. An operation
+    /// left out is refused with an error when the agent asks for it.
+    pub operations: McpMemoryOperations,
+    /// The `mcp_servers` entry `server` names, filled in by
+    /// [`Config::memory_config`]. Never read from the file.
+    #[cfg(feature = "mcp")]
+    #[serde(skip)]
+    pub server_config: Option<McpServerConfig>,
+}
+
+/// `memory.mcp.operations`: the tool call behind each memory operation.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpMemoryOperations {
+    pub view: Option<McpMemoryOperation>,
+    pub add: Option<McpMemoryOperation>,
+    pub queue_for_review: Option<McpMemoryOperation>,
+    pub replace: Option<McpMemoryOperation>,
+    pub supersede: Option<McpMemoryOperation>,
+    pub remove: Option<McpMemoryOperation>,
+    pub restore: Option<McpMemoryOperation>,
+    pub expand: Option<McpMemoryOperation>,
+    pub search: Option<McpMemoryOperation>,
+    pub record_outcome: Option<McpMemoryOperation>,
+    /// The text injected into the system prompt.
+    pub prompt: Option<McpMemoryOperation>,
+}
+
+/// One memory operation as an MCP tool call.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpMemoryOperation {
+    /// The tool to call on the server.
+    pub tool: String,
+    /// The tool's arguments. A string that is exactly `{name}` becomes that
+    /// value with its JSON type (the key is dropped when the value is
+    /// absent); `{name}` inside a longer string is replaced by its text.
+    #[serde(default)]
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+    /// A JSON pointer (`/results`) selecting the part of the tool's result
+    /// the operation returns. Default: the whole result.
+    #[serde(default)]
+    pub result: Option<String>,
+}
+
+/// The `memory.provider` backends.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryBackend {
+    #[default]
+    Sqlite,
+    Mcp,
+    Addon,
+}
+
+impl MemoryBackend {
+    /// The name as written in config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryBackend::Sqlite => "sqlite",
+            MemoryBackend::Mcp => "mcp",
+            MemoryBackend::Addon => "addon",
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -622,6 +706,52 @@ pub struct PluginSettings {
     /// self-engage at startup instead of waiting for a trigger. Plugin-
     /// specific: e.g. `backpressured` engages its loop when this is true.
     pub auto_start: Option<bool>,
+}
+
+/// The `addons` key: the Clojure IAddon host (cargo feature `addons`).
+/// Absent = enabled whenever a manifest is found in `.dirge/addons/` or
+/// `~/.config/dirge/addons/`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AddonsConfig {
+    /// `false` loads no addons. Default true.
+    pub enabled: Option<bool>,
+    /// Extra directories searched for `META-INF/addons/*.edn`.
+    pub paths: Vec<String>,
+    /// Extra source roots on the addon classpath (e.g. the `src` of the
+    /// IAddon protocol library), before `DIRGE_ADDON_PATH`.
+    pub source_paths: Vec<String>,
+    /// Namespace defining the IAddon protocol functions (`addon?`,
+    /// `initialize!`, `shutdown!`, `tools`, optionally `hooks` and `health`).
+    pub protocol_ns: Option<String>,
+    /// Seconds a prompt's run waits for `:dirge/session-start` answers
+    /// before it opens without them. Default 30.
+    pub session_start_timeout_secs: Option<u64>,
+    /// Seconds dirge waits for `:dirge/session-end` before it goes on (and,
+    /// on exit, closes the MCP servers). Default 10.
+    pub session_end_timeout_secs: Option<u64>,
+    /// An nREPL server inside the addon runtime (cargo feature
+    /// `addons-nrepl`). Absent = no server, unless `DIRGE_ADDON_NREPL` asks.
+    pub nrepl: Option<AddonsNreplConfig>,
+    /// After an nREPL evaluation or `dirge.harness/refresh!`, read every
+    /// addon's tools, hooks and commands again and hand the changes to the
+    /// running agent. Default true.
+    pub live_refresh: Option<bool>,
+}
+
+/// The `addons.nrepl` key.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AddonsNreplConfig {
+    /// `false` starts no server. Default true once the key is present.
+    pub enabled: Option<bool>,
+    /// Port to listen on; 0 (the default) lets the OS pick one.
+    pub port: Option<u16>,
+    /// Address to bind. Default `127.0.0.1`.
+    pub bind: Option<String>,
+    /// File the bound port is written to, relative to the working directory.
+    /// Default `.dirge/addons/.nrepl-port`; `""` writes none.
+    pub port_file: Option<String>,
 }
 
 /// Prompt-compression engine config. Disabled → no compression. Enabled with
@@ -970,6 +1100,9 @@ pub struct Config {
     /// the `.janet` file stem under a plugin search dir). Absent entry =
     /// enabled, not auto-started (backward compatible).
     pub plugins: Option<HashMap<String, PluginSettings>>,
+    /// Clojure IAddon host settings (cargo feature `addons`). Absent =
+    /// load every addon found in the default search directories.
+    pub addons: Option<AddonsConfig>,
     /// Claude-Code-compatible command hooks: the same shape as the `hooks`
     /// key of Claude Code's `settings.json` (event name to matcher groups
     /// of `{ "type": "command", "command", "timeout" }`). Absent = none.
@@ -981,6 +1114,12 @@ pub struct Config {
     /// Optional OS-level desktop notifications for turn completion and
     /// prompts waiting on human input. Absent/off by default.
     pub desktop_notifications: Option<DesktopNotificationConfig>,
+    /// External panel feed: a Server-Sent Events producer that drives
+    /// the side panels and posts notifications (`docs/panel-feed.md`).
+    /// Absent = off. Set `discovery_dir` (a directory holding a 0600
+    /// `dirge.json`, relative paths under `$XDG_RUNTIME_DIR`) or `url`
+    /// plus an optional `token_file`; `enabled = false` turns it off.
+    pub panel_feed: Option<crate::extras::panel_feed::discovery::PanelFeedConfig>,
     /// Prompt-compression engine config. `enabled = false` or
     /// `DIRGE_COMPRESSION=0` disables compression at runtime even when the
     /// feature is compiled in; the `preset` key picks the compression profile.
@@ -1040,6 +1179,11 @@ pub struct Config {
     pub escalation_provider: Option<String>,
     /// Optional provider for context summarization / compaction.
     pub summarization_provider: Option<String>,
+    /// Optional cheap provider (e.g. a DeepSeek alias) that digests a
+    /// subagent's final answer when it is too large to hand the parent
+    /// inline. The parent gets the digest plus the path to the full text,
+    /// instead of a head/tail excerpt. Unset keeps the excerpt.
+    pub subagent_digest_provider: Option<String>,
     /// Early-fold threshold as a fraction of the model's context window
     /// (e.g. `0.5`). Lowers the point at which history folds into a
     /// summary — and thus when the durable session checkpoint is written
@@ -1384,6 +1528,23 @@ pub struct Config {
 }
 
 impl Config {
+    /// The `memory` block with `memory.mcp.server` resolved against
+    /// `mcp_servers`, ready for `extras::memory_provider::build`. An
+    /// unknown server name stays unresolved; the factory reports it.
+    pub fn memory_config(&self) -> MemoryConfig {
+        #[allow(unused_mut)]
+        let mut memory = self.memory.clone().unwrap_or_default();
+        #[cfg(feature = "mcp")]
+        if let Some(mcp) = memory.mcp.as_mut() {
+            mcp.server_config = self
+                .mcp_servers
+                .as_ref()
+                .and_then(|servers| servers.get(&mcp.server))
+                .cloned();
+        }
+        memory
+    }
+
     /// Snapshot of the unified providers map. Empty when not set.
     pub fn providers_map(&self) -> HashMap<String, ProviderEntry> {
         self.providers.clone().unwrap_or_default()
@@ -1453,6 +1614,9 @@ impl Config {
             // Likewise opt-in: auto-approval resolves only when
             // `approval_provider` is explicitly set (no default fallback).
             ConfigRole::Approval => self.approval_provider.as_deref(),
+            // Opt-in: subagent results are digested only when
+            // `subagent_digest_provider` is explicitly set.
+            ConfigRole::SubagentDigest => self.subagent_digest_provider.as_deref(),
         };
         let alias = role_name?.to_string();
         if let Some(map) = providers
@@ -3036,6 +3200,41 @@ mod tests {
         assert_eq!(m.verbatim_pre_recall, Some(true));
     }
 
+    /// `memory.mcp` parses its operation table and `memory_config` resolves
+    /// the server name against `mcp_servers`; a typo in the table is a
+    /// parse error rather than an operation silently missing.
+    #[test]
+    fn memory_mcp_block_parses_and_resolves_its_server() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "mcp_servers": { "notes": { "url": "http://localhost:9/mcp" } },
+                "memory": { "provider": "mcp", "mcp": {
+                    "server": "notes",
+                    "operations": {
+                        "search": { "tool": "find", "arguments": { "q": "{query}" }, "result": "/hits" }
+                    }
+                } }
+            }"#,
+        )
+        .unwrap();
+        let memory = cfg.memory_config();
+        assert_eq!(memory.provider, Some(MemoryBackend::Mcp));
+        let mcp = memory.mcp.expect("mcp block");
+        assert_eq!(mcp.server, "notes");
+        let search = mcp.operations.search.expect("search operation");
+        assert_eq!(search.tool, "find");
+        assert_eq!(search.arguments["q"], "{query}");
+        assert_eq!(search.result.as_deref(), Some("/hits"));
+        assert!(mcp.operations.add.is_none());
+        #[cfg(feature = "mcp")]
+        assert!(mcp.server_config.is_some(), "server resolved");
+
+        let typo = serde_json::from_str::<Config>(
+            r#"{ "memory": { "mcp": { "server": "n", "operations": { "serach": { "tool": "t" } } } } }"#,
+        );
+        assert!(typo.is_err(), "unknown operation names are rejected");
+    }
+
     /// dirge-j0s2 (GH #461): `show_reasoning` controls whether the thinking
     /// burst is visible by default. Absent → false (current behavior).
     #[test]
@@ -3154,6 +3353,27 @@ mod tests {
         assert_eq!(desktop.enabled, Some(true));
         assert_eq!(desktop.on_completion, Some(false));
         assert_eq!(desktop.on_input_required, Some(true));
+    }
+
+    #[test]
+    fn panel_feed_is_absent_by_default_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.panel_feed.is_none());
+
+        let cfg: Config =
+            serde_json::from_str(r#"{"panel_feed": {"discovery_dir": "feeds"}}"#).unwrap();
+        let feed = cfg.panel_feed.expect("panel feed");
+        assert_eq!(feed.discovery_dir.as_deref(), Some("feeds"));
+        assert_eq!(feed.enabled, None);
+
+        let cfg: Config = serde_json::from_str(
+            r#"{"panel_feed": {"enabled": false, "url": "http://127.0.0.1:1", "token_file": "/t"}}"#,
+        )
+        .unwrap();
+        let feed = cfg.panel_feed.expect("panel feed");
+        assert_eq!(feed.enabled, Some(false));
+        assert_eq!(feed.token_file.as_deref(), Some("/t"));
+        assert_eq!(feed.source(None), None, "explicitly disabled");
     }
 
     #[test]

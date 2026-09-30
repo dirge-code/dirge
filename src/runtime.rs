@@ -115,6 +115,39 @@ where
     agent_handle().spawn(future)
 }
 
+/// Why [`blocking_within`] came back without the work's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoAnswer {
+    /// The work was still running when the budget ran out.
+    TimedOut(std::time::Duration),
+    /// The work panicked.
+    Failed(String),
+}
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoAnswer::TimedOut(budget) => write!(f, "no answer within {budget:?}"),
+            NoAnswer::Failed(why) => write!(f, "failed: {why}"),
+        }
+    }
+}
+
+/// Run blocking `work` on the agent runtime's blocking pool and wait at most
+/// `budget` for it, from any runtime. Work that outlasts the budget keeps
+/// its thread until it returns; the agent runtime is never dropped, so that
+/// thread cannot hold up dirge's exit.
+pub(crate) async fn blocking_within<T: Send + 'static>(
+    budget: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, NoAnswer> {
+    match tokio::time::timeout(budget, agent_handle().spawn_blocking(work)).await {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(error)) => Err(NoAnswer::Failed(error.to_string())),
+        Err(_) => Err(NoAnswer::TimedOut(budget)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +218,25 @@ mod tests {
             BLOCK_FOR > STALL_BAR,
             "a blocked UI must be distinguishable from a healthy one"
         );
+    }
+
+    #[tokio::test]
+    async fn blocking_work_answers_within_its_budget() {
+        assert_eq!(blocking_within(Duration::from_secs(5), || 7).await, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn blocking_work_past_its_budget_is_not_waited_for() {
+        let budget = Duration::from_millis(50);
+        let start = Instant::now();
+        let out = blocking_within(budget, || std::thread::sleep(BLOCK_FOR)).await;
+        assert_eq!(out, Err(NoAnswer::TimedOut(budget)));
+        assert!(start.elapsed() < STALL_BAR, "{:?}", start.elapsed());
+    }
+
+    #[tokio::test]
+    async fn blocking_work_that_panics_answers_failed() {
+        let out = blocking_within(Duration::from_secs(5), || -> u8 { panic!("boom") }).await;
+        assert!(matches!(out, Err(NoAnswer::Failed(_))), "{out:?}");
     }
 }

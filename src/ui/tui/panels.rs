@@ -15,7 +15,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color as RColor, Style};
 use ratatui::widgets::Widget;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::ui::panels_ext::ExternalPanels;
 use crate::ui::renderer::{LeftPanelInfo, PanelData, SubagentStatusRow};
 
 use super::chat::crossterm_to_ratatui;
@@ -27,6 +29,7 @@ use super::chat::crossterm_to_ratatui;
 #[derive(Clone)]
 pub struct SubPanel<'a> {
     title: &'a str,
+    badge: Option<String>,
     lines: Vec<(String, RColor)>,
     border_style: Style,
 }
@@ -35,6 +38,7 @@ impl<'a> SubPanel<'a> {
     pub fn new(title: &'a str) -> Self {
         Self {
             title,
+            badge: None,
             lines: Vec::new(),
             border_style: Style::default().fg(RColor::Green),
         }
@@ -47,9 +51,15 @@ impl<'a> SubPanel<'a> {
         self
     }
 
-    #[allow(dead_code)]
     pub fn border_style(mut self, style: Style) -> Self {
         self.border_style = style;
+        self
+    }
+
+    /// A short marker painted after the title (never truncated away
+    /// while it fits), e.g. `1/3` when only some panels are shown.
+    pub fn badge(mut self, badge: Option<String>) -> Self {
+        self.badge = badge;
         self
     }
 
@@ -67,36 +77,18 @@ impl<'a> Widget for SubPanel<'a> {
         let bs = self.border_style;
         let inner_w = area.width as usize - 2;
 
-        // Top border: ╭─[TITLE]─╮ centered.
-        let label = format!("[{}]", self.title);
-        let lw = label.chars().count();
-        let (lpad, rpad) = if lw >= inner_w {
-            (0, 0)
-        } else {
-            let pad = inner_w - lw;
-            (pad / 2, pad - pad / 2)
-        };
+        // Top border: ╭─[TITLE]─╮ centered. A title wider than the box
+        // is cut with an ellipsis; the badge (e.g. `1/3`) is kept whole.
+        let label = fit_label(self.title, self.badge.as_deref(), inner_w);
+        let lw = UnicodeWidthStr::width(label.as_str());
+        let pad = inner_w.saturating_sub(lw);
+        let lpad = pad / 2;
         buf[(area.x, area.y)].set_char('╭').set_style(bs);
-        for i in 0..lpad as u16 {
+        for i in 0..inner_w as u16 {
             buf[(area.x + 1 + i, area.y)].set_char('─').set_style(bs);
         }
-        if lw <= inner_w {
-            for (i, ch) in label.chars().enumerate() {
-                buf[(area.x + 1 + lpad as u16 + i as u16, area.y)]
-                    .set_char(ch)
-                    .set_style(bs);
-            }
-            let after = 1 + lpad + lw;
-            for i in 0..rpad {
-                buf[(area.x + (after + i) as u16, area.y)]
-                    .set_char('─')
-                    .set_style(bs);
-            }
-        } else {
-            // Title wider than inner — fall back to plain ────.
-            for i in 0..inner_w as u16 {
-                buf[(area.x + 1 + i, area.y)].set_char('─').set_style(bs);
-            }
+        if !label.is_empty() {
+            buf.set_stringn(area.x + 1 + lpad as u16, area.y, &label, inner_w, bs);
         }
         buf[(area.x + area.width - 1, area.y)]
             .set_char('╮')
@@ -129,12 +121,56 @@ impl<'a> Widget for SubPanel<'a> {
     }
 }
 
+/// Cut `s` to at most `max` display cells, ending in `…` when cut.
+/// Wide (CJK / emoji) glyphs count two cells and are never split.
+pub(crate) fn ellipsize_width(s: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max - 1 {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// The `[title badge]` label for a box `inner_w` cells wide: the title
+/// is ellipsized so the label fits; the badge is dropped only when not
+/// even it fits beside a one-cell title. Empty when no label fits.
+pub(crate) fn fit_label(title: &str, badge: Option<&str>, inner_w: usize) -> String {
+    // Two brackets, plus the title needs at least one cell.
+    let room = inner_w.saturating_sub(2);
+    let badge = badge.filter(|b| !b.is_empty());
+    if let Some(b) = badge {
+        let bw = UnicodeWidthStr::width(b) + 1;
+        if room > bw {
+            let t = ellipsize_width(title, room - bw);
+            return format!("[{t} {b}]");
+        }
+    }
+    if room == 0 {
+        return String::new();
+    }
+    format!("[{}]", ellipsize_width(title, room))
+}
+
 /// Left panel widget. Always renders the session vitals (context gauge,
 /// activity ticker, git); when subagents are running, their status rows
 /// render in a reserved region BELOW the vitals.
 pub struct LeftPanel<'a> {
     info: &'a LeftPanelInfo,
     subagents: &'a [SubagentStatusRow],
+    external: Option<&'a ExternalPanels>,
     style: Style,
 }
 
@@ -143,8 +179,15 @@ impl<'a> LeftPanel<'a> {
         Self {
             info,
             subagents,
+            external: None,
             style: Style::default().fg(RColor::Green),
         }
+    }
+
+    /// Externally-driven panels to paint above the AGENTS box.
+    pub fn external_panels(mut self, panels: &'a ExternalPanels) -> Self {
+        self.external = Some(panels);
+        self
     }
 
     /// Override the frame/border style so the left panel tracks the
@@ -161,7 +204,14 @@ impl<'a> Widget for LeftPanel<'a> {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        paint_idle_card(buf, area, self.info, self.subagents, self.style);
+        paint_idle_card(
+            buf,
+            area,
+            self.info,
+            self.subagents,
+            self.external,
+            self.style,
+        );
     }
 }
 
@@ -179,11 +229,75 @@ fn kfmt(n: u64) -> String {
     }
 }
 
+/// Dim second line under an `[AGENTS]` row: how long the subagent has run,
+/// how many tool calls so far, and what it did last, e.g.
+/// `↳ 1m05s · 4 tools · read path=src/lib.rs`. The short fixed-width parts
+/// lead so a narrow panel truncates the activity, not the counters. `None`
+/// before its first event, so a just-spawned row stays one line.
+pub(crate) fn subagent_preview_line(row: &SubagentStatusRow) -> Option<String> {
+    let activity = row.activity.as_deref()?;
+    let secs = row.elapsed_secs;
+    let elapsed = if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    };
+    let tools = match row.tool_calls {
+        0 => String::new(),
+        1 => " · 1 tool".to_string(),
+        n => format!(" · {n} tools"),
+    };
+    Some(format!("↳ {elapsed}{tools} · {activity}"))
+}
+
+/// Rows kept free for a minimal ACTIVITY box (top + 1 row + bottom +
+/// spacer) when sizing external panels, so they can't evict it.
+const ACTIVITY_MIN_ROWS: u16 = 4;
+
+/// One sub-panel ready to paint: title, optional badge, coloured body rows.
+type BoxLines = (String, Option<String>, Vec<(String, RColor)>);
+
+/// Fit external panels into `budget` rows (each box costs its body
+/// rows + 2 borders + 1 spacer). Panels are taken in paint order; one
+/// that doesn't fit whole is trimmed to the rows left (at least one
+/// body row), and panels past the budget are skipped. Empty panels
+/// show a placeholder row so an open panel is always visible.
+fn fit_external_panels(panels: &ExternalPanels, budget: u16) -> Vec<BoxLines> {
+    let mut left = budget as usize;
+    let mut out = Vec::new();
+    for p in panels.panels() {
+        if left < 4 {
+            break;
+        }
+        let want = p.lines.len().max(1);
+        let rows = want.min(left - 3);
+        let lines: Vec<(String, RColor)> = if p.lines.is_empty() {
+            vec![("·".to_string(), RColor::DarkGray)]
+        } else {
+            p.visible_lines(rows)
+                .map(|l| (l.text.clone(), crossterm_to_ratatui(l.face.color())))
+                .collect()
+        };
+        left -= rows + 3;
+        out.push((p.title.clone(), None, lines));
+    }
+    // When some panels did not fit, number the shown ones (`1/3`) so
+    // it is visible that more exist; the first is the focused one.
+    let total = panels.len();
+    if out.len() < total {
+        for (i, b) in out.iter_mut().enumerate() {
+            b.1 = Some(format!("{}/{total}", i + 1));
+        }
+    }
+    out
+}
+
 fn paint_idle_card(
     buf: &mut Buffer,
     area: Rect,
     info: &LeftPanelInfo,
     subagents: &[SubagentStatusRow],
+    external: Option<&ExternalPanels>,
     style: Style,
 ) {
     let dim = RColor::DarkGray;
@@ -219,17 +333,24 @@ fn paint_idle_card(
     // Helper: render a SubPanel of `lines` at the current `dy` if it
     // fits, advancing `dy` past it + a 1-row spacer. No-op when out of
     // vertical room.
-    let place = |buf: &mut Buffer, dy: &mut u16, title: &str, lines: Vec<(String, RColor)>| {
+    let place_badged = |buf: &mut Buffer,
+                        dy: &mut u16,
+                        title: &str,
+                        badge: Option<String>,
+                        lines: Vec<(String, RColor)>| {
         let h = 2 + lines.len() as u16;
         if box_w < 4 || area.y + *dy + h > area.y + area.height {
             return;
         }
-        let mut sp = SubPanel::new(title).border_style(bs);
+        let mut sp = SubPanel::new(title).border_style(bs).badge(badge);
         for (t, c) in lines {
             sp = sp.line(t, c);
         }
         sp.render(Rect::new(area.x, area.y + *dy, box_w, h), buf);
         *dy += h + 1;
+    };
+    let place = |buf: &mut Buffer, dy: &mut u16, title: &str, lines: Vec<(String, RColor)>| {
+        place_badged(buf, dy, title, None, lines)
     };
 
     // [CONTEXT] — fill bar + tokens/window + compaction count.
@@ -290,16 +411,35 @@ fn paint_idle_card(
     } else {
         subagents
             .iter()
-            .map(|r| {
+            .flat_map(|r| {
                 let label = match &r.agent {
                     Some(a) => format!("{a} {}", r.id_short),
                     None => r.id_short.clone(),
                 };
-                (label, green)
+                let mut rows = vec![(label, green)];
+                if let Some(preview) = subagent_preview_line(r) {
+                    rows.push((preview, dim));
+                }
+                rows
             })
             .collect()
     };
     let agents_reserve = 2 + agent_lines.len() as u16 + 1;
+
+    // External panels — sized from what is left after CONTEXT and the
+    // GIT/AGENTS reserves, keeping room for a minimal ACTIVITY box.
+    let external_budget = (area.y + area.height)
+        .saturating_sub(area.y + dy)
+        .saturating_sub(git_reserve)
+        .saturating_sub(agents_reserve)
+        .saturating_sub(ACTIVITY_MIN_ROWS);
+    let external_boxes = external
+        .map(|e| fit_external_panels(e, external_budget))
+        .unwrap_or_default();
+    let external_reserve: u16 = external_boxes
+        .iter()
+        .map(|(_, _, l)| 2 + l.len() as u16 + 1)
+        .sum();
 
     // [ACTIVITY] — recent tool ticker (newest last). Capped to whatever
     // vertical room is left after CONTEXT and the reserved GIT/AGENTS
@@ -310,6 +450,7 @@ fn paint_idle_card(
     let avail = (area.y + area.height)
         .saturating_sub(area.y + dy)
         .saturating_sub(git_reserve)
+        .saturating_sub(external_reserve)
         .saturating_sub(agents_reserve);
     let max_act = avail.saturating_sub(2) as usize; // minus the box borders
     if max_act >= 1 {
@@ -329,6 +470,10 @@ fn paint_idle_card(
 
     if let Some(lines) = git_lines {
         place(buf, &mut dy, "GIT", lines);
+    }
+
+    for (title, badge, lines) in external_boxes {
+        place_badged(buf, &mut dy, &title, badge, lines);
     }
 
     // [AGENTS]
@@ -836,6 +981,98 @@ mod tests {
         assert_eq!(row(3), expected_bot);
     }
 
+    fn top_row(title: &str, badge: Option<&str>, w: u16) -> String {
+        let mut backend = TestBackend::new(w, 3);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    SubPanel::new(title)
+                        .badge(badge.map(str::to_string))
+                        .line("a", RColor::Green),
+                    Rect::new(0, 0, w, 3),
+                );
+            })
+            .unwrap();
+        backend = terminal.backend().clone();
+        let buf = backend.buffer();
+        // Skip the blank cell ratatui leaves after a wide glyph.
+        let mut out = String::new();
+        let mut x = 0;
+        while x < w {
+            let sym = buf.cell((x, 0)).unwrap().symbol().to_string();
+            x += UnicodeWidthStr::width(sym.as_str()).max(1) as u16;
+            out.push_str(&sym);
+        }
+        out
+    }
+
+    /// A title wider than the box is cut with an ellipsis instead of
+    /// disappearing, and the frame keeps its exact width.
+    #[test]
+    fn subpanel_long_title_is_ellipsized() {
+        let title = "Producer  tab 1/2 (6 agents: alpha, beta, gamma, delta, epsilon)";
+        let row = top_row(title, None, 46);
+        assert_eq!(UnicodeWidthStr::width(row.as_str()), 46, "{row}");
+        assert!(row.starts_with("╭[Producer  tab 1/2"), "{row}");
+        assert!(row.ends_with("…]╮"), "{row}");
+    }
+
+    #[test]
+    fn fit_label_boundaries() {
+        // Exactly fits: no ellipsis.
+        assert_eq!(fit_label("ABCD", None, 6), "[ABCD]");
+        // One cell short: cut with an ellipsis.
+        assert_eq!(fit_label("ABCDE", None, 6), "[ABC…]");
+        // Tiny boxes degrade to a lone ellipsis, then to nothing.
+        assert_eq!(fit_label("ABCDE", None, 3), "[…]");
+        assert_eq!(fit_label("ABCDE", None, 2), "");
+        // The badge stays whole; the title yields.
+        assert_eq!(fit_label("ABCDEFGH", Some("1/3"), 10), "[ABC… 1/3]");
+        assert_eq!(fit_label("AB", Some("1/3"), 10), "[AB 1/3]");
+        // No room for the badge: title only.
+        assert_eq!(fit_label("ABCDEFGH", Some("1/3"), 5), "[AB…]");
+    }
+
+    #[test]
+    fn ellipsize_counts_wide_glyphs() {
+        // Each CJK glyph is two cells; never split one.
+        assert_eq!(ellipsize_width("漢字テスト", 10), "漢字テスト");
+        assert_eq!(ellipsize_width("漢字テスト", 9), "漢字テス…");
+        assert_eq!(ellipsize_width("漢字テスト", 8), "漢字テ…");
+        assert_eq!(ellipsize_width("漢字テスト", 6), "漢字…");
+        assert_eq!(ellipsize_width("漢字テスト", 4), "漢…");
+        assert_eq!(ellipsize_width("🚀🚀🚀", 4), "🚀…");
+        assert_eq!(ellipsize_width("🚀🚀🚀", 2), "…");
+        assert_eq!(ellipsize_width("🚀🚀🚀", 0), "");
+        for max in 0..12 {
+            assert!(UnicodeWidthStr::width(ellipsize_width("a漢🚀b字テ", max).as_str()) <= max);
+        }
+        let row = top_row("漢字テスト漢字テスト漢字", None, 12);
+        assert_eq!(UnicodeWidthStr::width(row.as_str()), 12, "{row}");
+        assert!(row.contains('…'), "{row}");
+    }
+
+    /// When not every external panel fits, the shown ones are numbered.
+    #[test]
+    fn external_panels_that_do_not_all_fit_are_numbered() {
+        use crate::ui::panels_ext::{ExternalPanels, PanelFace, PanelLine, PanelOp};
+        let mut ext = ExternalPanels::default();
+        for id in ["a", "b", "c"] {
+            ext.apply(PanelOp::Show {
+                id: id.into(),
+                title: id.to_uppercase(),
+                lines: vec![PanelLine::new("x", PanelFace::Normal); 4],
+            });
+        }
+        let one = fit_external_panels(&ext, 8);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].1.as_deref(), Some("1/3"));
+        let all = fit_external_panels(&ext, 40);
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|b| b.1.is_none()));
+    }
+
     /// The left + right panels' frame borders follow the border
     /// style passed by the caller (the main chat frame's color),
     /// not a hardcoded green. Guards the "panels match the main
@@ -1068,6 +1305,88 @@ mod tests {
         );
     }
 
+    fn dump_left_panel(
+        info: &LeftPanelInfo,
+        ext: &crate::ui::panels_ext::ExternalPanels,
+        w: u16,
+        h: u16,
+    ) -> Vec<String> {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    LeftPanel::new(info, &[]).external_panels(ext),
+                    Rect::new(0, 0, w, h),
+                )
+            })
+            .unwrap();
+        let backend = terminal.backend().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// External panels paint as their own boxes BETWEEN the vitals and
+    /// the AGENTS box, focused panel first.
+    #[test]
+    fn left_panel_paints_external_panels_above_agents() {
+        use crate::ui::panels_ext::{ExternalPanels, PanelFace, PanelLine, PanelOp};
+        let info = LeftPanelInfo::default();
+        let mut ext = ExternalPanels::default();
+        ext.apply(PanelOp::Show {
+            id: "status".into(),
+            title: "STATUS".into(),
+            lines: vec![PanelLine::new("all good", PanelFace::Success)],
+        });
+        ext.apply(PanelOp::FocusTab {
+            id: "log".into(),
+            title: "LOG".into(),
+        });
+        ext.apply(PanelOp::AppendTab {
+            id: "log".into(),
+            line: PanelLine::new("event one", PanelFace::Dim),
+        });
+        let rows = dump_left_panel(&info, &ext, 30, 40);
+        let dump = rows.join("\n");
+        let find = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing:\n{dump}"))
+        };
+        let (log, status, agents) = (find("[LOG]"), find("[STATUS]"), find("[AGENTS]"));
+        assert!(log < status, "focused panel paints first:\n{dump}");
+        assert!(status < agents, "external panels sit above AGENTS:\n{dump}");
+        assert!(dump.contains("event one") && dump.contains("all good"));
+        assert!(dump.contains("CONTEXT"), "vitals still painted:\n{dump}");
+    }
+
+    /// On a short panel an oversized external panel is trimmed so the
+    /// AGENTS box still fits below it.
+    #[test]
+    fn left_panel_external_panels_respect_height_reserve() {
+        use crate::ui::panels_ext::{ExternalPanels, PanelFace, PanelLine, PanelOp};
+        let info = LeftPanelInfo::default();
+        let mut ext = ExternalPanels::default();
+        ext.apply(PanelOp::Show {
+            id: "big".into(),
+            title: "BIG".into(),
+            lines: (0..100)
+                .map(|i| PanelLine::new(format!("row {i}"), PanelFace::Normal))
+                .collect(),
+        });
+        let rows = dump_left_panel(&info, &ext, 30, 24);
+        let dump = rows.join("\n");
+        assert!(dump.contains("[BIG]"), "external panel missing:\n{dump}");
+        assert!(dump.contains("row 0"), "head of a Show panel kept:\n{dump}");
+        assert!(!dump.contains("row 99"), "body trimmed to fit:\n{dump}");
+        assert!(dump.contains("[AGENTS]"), "AGENTS box evicted:\n{dump}");
+    }
+
     /// LeftPanel with running subagents lists them inside the AGENTS box
     /// instead of the stale hardcoded placeholder names.
     #[test]
@@ -1088,10 +1407,14 @@ mod tests {
             SubagentStatusRow {
                 id_short: "abc123".into(),
                 agent: Some("architect".into()),
+                activity: Some("read path=src/lib.rs".into()),
+                tool_calls: 4,
+                elapsed_secs: 65,
             },
             SubagentStatusRow {
                 id_short: "zzz999".into(),
                 agent: None,
+                ..Default::default()
             },
         ];
         let backend = TestBackend::new(30, 50);
@@ -1131,6 +1454,10 @@ mod tests {
             "id_short fallback should appear for an unnamed subagent:\n{dump}"
         );
         assert!(
+            box_body.contains("↳ 1m05s · 4 tools"),
+            "a subagent with activity should show a preview line, counters first:\n{box_body}"
+        );
+        assert!(
             !box_body.contains("build the parser"),
             "prompt prose must NOT appear in the AGENTS box:\n{box_body}"
         );
@@ -1158,10 +1485,12 @@ mod tests {
             SubagentStatusRow {
                 id_short: "aaa111".into(),
                 agent: Some("architect".into()),
+                ..Default::default()
             },
             SubagentStatusRow {
                 id_short: "bbb222".into(),
                 agent: Some("architect".into()),
+                ..Default::default()
             },
         ];
         let backend = TestBackend::new(30, 50);
