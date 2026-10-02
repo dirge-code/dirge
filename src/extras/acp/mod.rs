@@ -571,7 +571,7 @@ async fn run_prompt(
                 // and the eventual completion. Previously dirge
                 // skipped this transition; consumers had no way to
                 // distinguish "queued" from "running".
-                if let Some(acp_id) = correlator.resolve(id.as_str()) {
+                if let Some(acp_id) = correlator.started(id.as_str()) {
                     let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
                     let update = ToolCallUpdate::new(acp_id, fields);
                     let notif = SessionNotification::new(
@@ -1085,6 +1085,8 @@ fn build_acp_permission(
 struct ToolCallCorrelator {
     by_id: std::collections::HashMap<String, ToolCallId>,
     fifo: std::collections::VecDeque<ToolCallId>,
+    /// How many calls at the front of `fifo` have started.
+    fifo_started: usize,
 }
 
 impl ToolCallCorrelator {
@@ -1098,15 +1100,28 @@ impl ToolCallCorrelator {
         }
     }
 
-    /// Resolve a result's rig_id to the originally-issued acp_id.
-    /// Returns `None` if no matching call is in-flight; callers
-    /// emit a stub empty id in that (shouldn't-happen) case.
+    /// The acp_id of a call that has started running. The call
+    /// stays in flight, so its result still resolves to this id.
+    /// Empty rig_ids take the oldest call not yet started.
+    fn started(&mut self, rig_id: &str) -> Option<ToolCallId> {
+        if !rig_id.is_empty() {
+            return self.by_id.get(rig_id).cloned();
+        }
+        let acp_id = self.fifo.get(self.fifo_started).cloned()?;
+        self.fifo_started += 1;
+        Some(acp_id)
+    }
+
+    /// Resolve a result's rig_id to the originally-issued acp_id
+    /// and end the call. Returns `None` if no matching call is
+    /// in flight.
     fn resolve(&mut self, rig_id: &str) -> Option<ToolCallId> {
         if !rig_id.is_empty() {
-            self.by_id.remove(rig_id)
-        } else {
-            self.fifo.pop_front()
+            return self.by_id.remove(rig_id);
         }
+        let acp_id = self.fifo.pop_front()?;
+        self.fifo_started = self.fifo_started.saturating_sub(1);
+        Some(acp_id)
     }
 }
 
@@ -1341,6 +1356,41 @@ mod tests {
         let mut c = ToolCallCorrelator::default();
         assert_eq!(c.resolve("missing"), None);
         assert_eq!(c.resolve(""), None);
+    }
+
+    /// The ACP id of a call is the same on its `tool_call`, its
+    /// in_progress update and its completed update.
+    #[test]
+    fn correlator_keeps_id_from_started_to_result() {
+        let mut c = ToolCallCorrelator::default();
+        let acp_a = ToolCallId::new("acp-A".to_string());
+        c.record("rig-A", acp_a.clone());
+
+        assert_eq!(c.started("rig-A"), Some(acp_a.clone()));
+        assert_eq!(c.resolve("rig-A"), Some(acp_a));
+        assert_eq!(c.resolve("rig-A"), None);
+    }
+
+    /// Empty rig ids: each start and each result pairs with its own
+    /// call in request order, also when both calls start first.
+    #[test]
+    fn correlator_keeps_fifo_ids_from_started_to_result() {
+        let mut c = ToolCallCorrelator::default();
+        let acp_a = ToolCallId::new("acp-A".to_string());
+        let acp_b = ToolCallId::new("acp-B".to_string());
+        let acp_c = ToolCallId::new("acp-C".to_string());
+        c.record("", acp_a.clone());
+        c.record("", acp_b.clone());
+
+        assert_eq!(c.started(""), Some(acp_a.clone()));
+        assert_eq!(c.started(""), Some(acp_b.clone()));
+        assert_eq!(c.started(""), None);
+        assert_eq!(c.resolve(""), Some(acp_a));
+
+        c.record("", acp_c.clone());
+        assert_eq!(c.resolve(""), Some(acp_b));
+        assert_eq!(c.started(""), Some(acp_c.clone()));
+        assert_eq!(c.resolve(""), Some(acp_c));
     }
 
     /// dirge-6po9: an `AgentEvent::Error` must not be swallowed into a
