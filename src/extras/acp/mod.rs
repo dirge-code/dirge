@@ -1,4 +1,5 @@
 pub mod config;
+pub mod model_option;
 
 use std::sync::Arc;
 
@@ -6,8 +7,9 @@ use agent_client_protocol::schema::v1::*;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Responder, Stdio};
 use agent_client_protocol::{on_receive_notification, on_receive_request};
 
+use self::model_option::{configured_models, model_config_option, requested_model};
 use crate::cli::Cli;
-use crate::config::{Config, ProviderEntry};
+use crate::config::Config;
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
 use crate::permission::ask::AskSender;
@@ -216,6 +218,16 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
             },
             on_receive_request!(),
         )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                    let state = state.clone();
+                    async move { handle_set_config_option(req, responder, &state).await }
+                }
+            },
+            on_receive_request!(),
+        )
         .on_receive_notification(
             {
                 let state = state.clone();
@@ -306,7 +318,9 @@ async fn handle_new_session(
         },
     );
 
-    let resp = NewSessionResponse::new(session_id.clone());
+    let options =
+        session_config_options(&state.sessions, &state.cli, &state.cfg, &session_id.0).await;
+    let resp = NewSessionResponse::new(session_id.clone()).config_options(options);
     responder.respond(resp)?;
 
     // dirge-32k9 (gh#714): announce the slash commands so ACP clients (Zed, etc.) can
@@ -322,6 +336,18 @@ async fn handle_new_session(
     );
     let _ = cx.send_notification(notif);
     Ok(())
+}
+
+/// `session/set_config_option`: the client picked a value for a config option.
+async fn handle_set_config_option(
+    req: SetSessionConfigOptionRequest,
+    responder: Responder<SetSessionConfigOptionResponse>,
+    state: &AcpState,
+) -> Result<(), agent_client_protocol::Error> {
+    match apply_model_config(&state.sessions, &state.cli, &state.cfg, &req).await {
+        Ok(options) => responder.respond(SetSessionConfigOptionResponse::new(options)),
+        Err(err) => responder.respond_with_error(err),
+    }
 }
 
 async fn handle_prompt(
@@ -368,34 +394,8 @@ async fn run_prompt(
     let provider_str = provider_override
         .clone()
         .unwrap_or_else(|| state.cli.resolve_provider(&state.cfg));
-    let (model_str, model_explicit) = if let Some(m) = model_override.clone() {
-        // A `/model` switch is an explicit choice — skip the alias-default and
-        // Codex-default substitutions the default path applies below.
-        (m, true)
-    } else {
-        let config_model = state
-            .cfg
-            .resolve_role(crate::config::ConfigRole::Default)
-            .and_then(|(_, e)| e.model);
-        let model_str = if state.cli.model.is_none() && config_model.is_none() {
-            // dirge-j3jd: resolve the alias's provider TYPE so a custom alias
-            // doesn't fall back to the OpenRouter default model id.
-            CompactString::new(crate::provider::default_model_for_alias(
-                &provider_str,
-                &state.cfg.providers_map(),
-            ))
-        } else {
-            state.cli.resolve_model(&state.cfg)
-        };
-        let model_explicit = crate::provider::model_is_explicit(
-            &provider_str,
-            &model_str,
-            &state.cfg.providers_map(),
-            state.cli.model.is_some(),
-            config_model.is_some(),
-        );
-        (model_str, model_explicit)
-    };
+    let (model_str, model_explicit) =
+        resolve_turn_model(&state.cli, &state.cfg, &provider_str, model_override);
 
     let current_mode = resolve_acp_mode(&state.cli, &state.cfg, mode_override);
 
@@ -419,6 +419,13 @@ async fn run_prompt(
         .await
     {
         let _ = cx.send_notification(agent_text_chunk(&session_id, reply));
+        // A `/model` switch changes the `model` config option; tell the client.
+        if cmd == "model" {
+            let options =
+                session_config_options(&state.sessions, &state.cli, &state.cfg, &id_key).await;
+            let update = SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options));
+            let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
+        }
         let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
         return Ok(());
     }
@@ -882,30 +889,8 @@ async fn acp_cd(sessions: &SessionMap, id: &str, args: &str) -> String {
     }
 }
 
-/// `(model, alias, is_active)` rows for the configured providers that pin a
-/// model — the `/model` listing. Mirrors the interactive handler's helper.
-fn acp_configured_models(
-    providers: &HashMap<String, ProviderEntry>,
-    current: &str,
-) -> Vec<(String, String, bool)> {
-    let mut rows: Vec<(String, String, bool)> = providers
-        .iter()
-        .filter_map(|(alias, entry)| {
-            entry
-                .model
-                .as_ref()
-                .map(|m| (m.clone(), alias.clone(), m == current))
-        })
-        .collect();
-    rows.sort();
-    rows
-}
-
 /// `/model` over ACP: with no arg, list the current + configured models; with
-/// an arg, record a session-scoped switch. Routing mirrors the interactive
-/// `/model` via [`resolve_model_route`], but the switch is applied lazily —
-/// the override is stored and the next prompt's `run_prompt` builds the client
-/// (surfacing any auth error then), so this stays side-effect-free.
+/// an arg, record a session-scoped switch (see [`switch_session_model`]).
 async fn acp_model(
     sessions: &SessionMap,
     cfg: &Config,
@@ -914,11 +899,11 @@ async fn acp_model(
     current_provider: &str,
     current_model: &str,
 ) -> String {
-    let providers = cfg.providers_map();
     let new_model = args.trim();
     if new_model.is_empty() {
+        let providers = cfg.providers_map();
         let mut out = format!("current model: {current_model}\n");
-        let rows = acp_configured_models(&providers, current_model);
+        let rows = configured_models(&providers, current_model);
         if rows.is_empty() {
             out.push_str(
                 "no models pinned in `providers` config — /model <id> switches to any model your provider supports",
@@ -933,10 +918,35 @@ async fn acp_model(
         }
         return out;
     }
+    let switched = switch_session_model(
+        sessions,
+        cfg,
+        id,
+        current_provider,
+        current_model,
+        new_model,
+    )
+    .await;
+    match switched {
+        Ok(note) => format!("switched to model: {new_model}{note}"),
+        Err(refusal) => refusal,
+    }
+}
 
-    // Shared routing decision; only the DECISION is used here — the client is
-    // built lazily by the next `run_prompt` (see the doc comment above), so
-    // there is nothing live to apply it to.
+/// Record a session-scoped switch to `new_model`, shared by `/model` and the
+/// `model` config option. Routing mirrors the interactive `/model` via
+/// [`resolve_model_route`], but the switch is applied lazily: the override is
+/// stored and the next prompt's `run_prompt` builds the client (surfacing any
+/// auth error then), so this stays side-effect-free. `Ok` carries a note to
+/// append to the confirmation; `Err` is the refusal, with the session unchanged.
+async fn switch_session_model(
+    sessions: &SessionMap,
+    cfg: &Config,
+    id: &str,
+    current_provider: &str,
+    current_model: &str,
+    new_model: &str,
+) -> Result<String, String> {
     let (provider_override, note) = match resolve_model_route(cfg, current_provider, new_model) {
         ModelRoute::Provider { alias, .. } => {
             let note = format!("  ·  {alias}");
@@ -944,7 +954,9 @@ async fn acp_model(
         }
         ModelRoute::Unroutable { model, family } => {
             let refusal = RouteRefusal::NoProviderForFamily { model, family };
-            return format!("{refusal} Keeping model '{current_model}' on '{current_provider}'.",);
+            return Err(format!(
+                "{refusal} Keeping model '{current_model}' on '{current_provider}'.",
+            ));
         }
         // GH #831: an id matching no configured alias and no known model family
         // still applies (see `ModelSwitch::KeepUnrecognized`), but say so — the
@@ -968,7 +980,93 @@ async fn acp_model(
             s.session.provider = CompactString::new(alias);
         }
     }
-    format!("switched to model: {new_model}{note}")
+    Ok(note)
+}
+
+/// The model a turn runs on for `provider`: the session's `/model` override
+/// (an explicit choice), else the CLI/config default. The bool says whether
+/// the model was chosen explicitly.
+fn resolve_turn_model(
+    cli: &Cli,
+    cfg: &Config,
+    provider: &str,
+    model_override: Option<CompactString>,
+) -> (CompactString, bool) {
+    if let Some(m) = model_override {
+        // A `/model` switch is an explicit choice — skip the alias-default and
+        // Codex-default substitutions the default path applies.
+        return (m, true);
+    }
+    let config_model = cfg
+        .resolve_role(crate::config::ConfigRole::Default)
+        .and_then(|(_, e)| e.model);
+    let model = if cli.model.is_none() && config_model.is_none() {
+        // dirge-j3jd: resolve the alias's provider TYPE so a custom alias
+        // doesn't fall back to the OpenRouter default model id.
+        CompactString::new(crate::provider::default_model_for_alias(
+            provider,
+            &cfg.providers_map(),
+        ))
+    } else {
+        cli.resolve_model(cfg)
+    };
+    let explicit = crate::provider::model_is_explicit(
+        provider,
+        &model,
+        &cfg.providers_map(),
+        cli.model.is_some(),
+        config_model.is_some(),
+    );
+    (model, explicit)
+}
+
+/// The `(provider, model)` a session's next turn runs on, overrides applied.
+async fn session_route(
+    sessions: &SessionMap,
+    cli: &Cli,
+    cfg: &Config,
+    id: &str,
+) -> (CompactString, CompactString) {
+    let (model_override, provider_override, _) = session_overrides(sessions, id).await;
+    let provider = provider_override.unwrap_or_else(|| cli.resolve_provider(cfg));
+    let (model, _) = resolve_turn_model(cli, cfg, &provider, model_override);
+    (provider, model)
+}
+
+/// The session config options dirge offers, with the session's current values.
+async fn session_config_options(
+    sessions: &SessionMap,
+    cli: &Cli,
+    cfg: &Config,
+    id: &str,
+) -> Vec<SessionConfigOption> {
+    let (_, model) = session_route(sessions, cli, cfg, id).await;
+    vec![model_config_option(&cfg.providers_map(), &model)]
+}
+
+/// `session/set_config_option`: switch the session's model and answer with the
+/// full option set. A request for another option, a non-id value, an unknown
+/// session or a refused route is an error and changes nothing.
+async fn apply_model_config(
+    sessions: &SessionMap,
+    cli: &Cli,
+    cfg: &Config,
+    req: &SetSessionConfigOptionRequest,
+) -> Result<Vec<SessionConfigOption>, agent_client_protocol::Error> {
+    let new_model = requested_model(req).map_err(|e| invalid_params(e.to_string()))?;
+    let id = req.session_id.to_string();
+    if !sessions.lock().await.contains_key(&id) {
+        return Err(agent_client_protocol::Error::resource_not_found(Some(id)));
+    }
+    let (provider, model) = session_route(sessions, cli, cfg, &id).await;
+    switch_session_model(sessions, cfg, &id, &provider, &model, new_model)
+        .await
+        .map_err(invalid_params)?;
+    Ok(session_config_options(sessions, cli, cfg, &id).await)
+}
+
+fn invalid_params(message: String) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(serde_json::Value::String(message))
 }
 
 /// `/mode` over ACP: with no arg, show the current mode and options; with an
@@ -1805,5 +1903,115 @@ mod tests {
                 crate::permission::ask::UserDecision::Deny { .. }
             ));
         }
+    }
+
+    // ACP `model` session config option.
+
+    fn default_cli() -> Cli {
+        use clap::Parser as _;
+        Cli::parse_from(["dirge"])
+    }
+
+    fn set_model_request(id: &str, config_id: &str, model: &str) -> SetSessionConfigOptionRequest {
+        SetSessionConfigOptionRequest::new(
+            SessionId::new(id.to_string()),
+            config_id.to_string(),
+            SessionConfigOptionValue::value_id(model.to_string()),
+        )
+    }
+
+    fn selected_model(options: &[SessionConfigOption]) -> String {
+        let json = serde_json::to_value(options).unwrap();
+        assert_eq!(json[0]["id"], model_option::MODEL_CONFIG_ID);
+        json[0]["currentValue"].as_str().unwrap().to_string()
+    }
+
+    fn error_code(err: &agent_client_protocol::Error) -> i64 {
+        serde_json::to_value(err).unwrap()["code"].as_i64().unwrap()
+    }
+
+    /// With no override the session runs the CLI/config default; a `/model`
+    /// override wins and counts as an explicit choice.
+    #[tokio::test]
+    async fn session_route_prefers_the_model_override() {
+        let (cli, cfg, id) = (default_cli(), Config::default(), "s");
+        let sessions = session_map_with(id);
+        let (provider, model) = session_route(&sessions, &cli, &cfg, id).await;
+        let (default_model, _) = resolve_turn_model(&cli, &cfg, &provider, None);
+        assert_eq!(model, default_model);
+
+        acp_model(&sessions, &cfg, id, "llama-3.1", &provider, &model).await;
+        let (_, switched) = session_route(&sessions, &cli, &cfg, id).await;
+        assert_eq!(switched, "llama-3.1");
+        let over = Some(CompactString::new("llama-3.1"));
+        assert_eq!(
+            resolve_turn_model(&cli, &cfg, &provider, over),
+            (CompactString::new("llama-3.1"), true),
+        );
+    }
+
+    /// The options a new session advertises select the model it will run.
+    #[tokio::test]
+    async fn session_options_select_the_session_model() {
+        let (cli, cfg, id) = (default_cli(), Config::default(), "s");
+        let sessions = session_map_with(id);
+        let (_, model) = session_route(&sessions, &cli, &cfg, id).await;
+        let options = session_config_options(&sessions, &cli, &cfg, id).await;
+        assert_eq!(options.len(), 1);
+        assert_eq!(selected_model(&options), model.as_str());
+    }
+
+    /// `session/set_config_option` on `model` records the switch and answers
+    /// with the option now selecting the new model.
+    #[tokio::test]
+    async fn set_model_option_switches_the_session_model() {
+        let (cli, cfg, id) = (default_cli(), Config::default(), "s");
+        let sessions = session_map_with(id);
+        let req = set_model_request(id, "model", "llama-3.1");
+        let options = apply_model_config(&sessions, &cli, &cfg, &req)
+            .await
+            .expect("the switch applies");
+        assert_eq!(selected_model(&options), "llama-3.1");
+        let (model_ovr, _, _) = session_overrides(&sessions, id).await;
+        assert_eq!(model_ovr.as_deref(), Some("llama-3.1"));
+    }
+
+    /// A value id padded with whitespace switches to the trimmed model: the
+    /// session stores the id without the padding.
+    #[tokio::test]
+    async fn set_model_option_stores_the_trimmed_model() {
+        let (cli, cfg, id) = (default_cli(), Config::default(), "s");
+        let sessions = session_map_with(id);
+        let req = set_model_request(id, "model", "  llama-3.1\n");
+        let options = apply_model_config(&sessions, &cli, &cfg, &req)
+            .await
+            .expect("the switch applies");
+        assert_eq!(selected_model(&options), "llama-3.1");
+        let (model_ovr, _, _) = session_overrides(&sessions, id).await;
+        assert_eq!(model_ovr.as_deref(), Some("llama-3.1"));
+    }
+
+    /// An unknown session or option is an error and leaves every session as
+    /// it was.
+    #[tokio::test]
+    async fn set_model_option_rejects_bad_requests() {
+        let (cli, cfg, id) = (default_cli(), Config::default(), "s");
+        let sessions = session_map_with(id);
+
+        let ghost = set_model_request("ghost", "model", "llama-3.1");
+        let err = apply_model_config(&sessions, &cli, &cfg, &ghost)
+            .await
+            .unwrap_err();
+        assert_eq!(error_code(&err), -32002, "unknown session: {err:?}");
+
+        let other = set_model_request(id, "effort", "high");
+        let err = apply_model_config(&sessions, &cli, &cfg, &other)
+            .await
+            .unwrap_err();
+        assert_eq!(error_code(&err), -32602, "unknown option: {err:?}");
+
+        let (model_ovr, provider_ovr, _) = session_overrides(&sessions, id).await;
+        assert!(model_ovr.is_none() && provider_ovr.is_none());
+        assert!(!sessions.lock().await.contains_key("ghost"));
     }
 }
