@@ -1303,3 +1303,6 @@ ACP server configs (in `acp_servers`) support two transport types:
 
 When `--acp` is passed without `--acp-host`, dirge runs in stdio mode
 (the editor spawns it as a subprocess). With `--acp-host`, it listens on TCP.
+
+For what dirge reports over ACP, such as each prompt's token usage and cost,
+see [acp.md](acp.md).

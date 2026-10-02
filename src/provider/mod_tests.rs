@@ -1412,6 +1412,31 @@ fn default_model_for_alias_uses_map_then_builtin_fallback() {
     assert_eq!(default_model_for("my-openai"), "deepseek/deepseek-v4-flash");
 }
 
+/// A provider alias resolves to the provider TYPE its entry declares; a name
+/// with no entry, or an entry with no explicit type, is its own type.
+#[test]
+fn provider_type_for_alias_uses_map_then_the_alias_itself() {
+    let providers = HashMap::from([
+        (
+            "work-claude".to_string(),
+            ProviderEntry {
+                provider_type: Some("anthropic".to_string()),
+                ..Default::default()
+            },
+        ),
+        ("deepseek".to_string(), ProviderEntry::default()),
+    ]);
+    assert_eq!(
+        provider_type_for_alias("work-claude", &providers),
+        "anthropic"
+    );
+    assert_eq!(provider_type_for_alias("deepseek", &providers), "deepseek");
+    assert_eq!(
+        provider_type_for_alias("Anthropic", &providers),
+        "anthropic"
+    );
+}
+
 /// dirge-8sku: an UNTRUSTED plugin shadowing a built-in name is still
 /// rejected (collision guard ENFORCED) — guards against credential
 /// interception. Tested directly via the validator since the plugin

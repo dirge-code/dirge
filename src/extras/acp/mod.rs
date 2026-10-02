@@ -525,6 +525,9 @@ async fn run_prompt(
     // headless loop in `provider/run.rs`.
     let mut full_response = String::new();
     let mut turn_tool_calls: Vec<ToolCallEntry> = Vec::new();
+    // Summed over every model call this prompt made, and reported to the
+    // client in the prompt response's `_meta.usage`.
+    let mut usage = TurnUsage::default();
 
     // F5: correlate rig tool-call ids with ACP ids so parallel
     // calls pair with their results correctly. See
@@ -628,11 +631,23 @@ async fn run_prompt(
                 );
                 let _ = cx.send_notification(notif);
             }
-            AgentEvent::Done { response, .. } => {
+            AgentEvent::Done { response, cost, .. } => {
                 // `Done.response` is the authoritative full text.
                 full_response = response.to_string();
+                usage.cost_usd = cost;
                 break;
             }
+            AgentEvent::Usage {
+                input_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+                output_tokens,
+            } => usage.add(
+                input_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+                output_tokens,
+            ),
             AgentEvent::Error(error) => {
                 // dirge-6po9: don't swallow the error and report a clean
                 // EndTurn — the editor client would see a truncated/empty
@@ -670,7 +685,6 @@ async fn run_prompt(
             }
             AgentEvent::TurnStart { .. }
             | AgentEvent::TurnEnd { .. }
-            | AgentEvent::Usage { .. }
             | AgentEvent::CompactionStarted { .. }
             | AgentEvent::ContextCompacted { .. }
             | AgentEvent::CheckpointRefresh { .. }
@@ -721,8 +735,66 @@ async fn run_prompt(
     } else {
         StopReason::EndTurn
     };
-    let _ = responder.respond(PromptResponse::new(reason));
+    // `provider_str` is an alias; the usage convention follows the provider
+    // type its entry declares.
+    let provider_type =
+        crate::provider::provider_type_for_alias(&provider_str, &state.cfg.providers_map());
+    let _ = responder.respond(PromptResponse::new(reason).meta(usage.meta(&provider_type)));
     Ok(())
+}
+
+/// Token usage and cost of one ACP prompt, summed over every model call the
+/// prompt made (a prompt with tool calls makes several).
+///
+/// ACP has no stable field for this: `PromptResponse.usage` exists only
+/// behind the schema crate's `unstable_end_turn_token_usage` feature. dirge
+/// reports it in the response's `_meta.usage` instead, with the field names
+/// of that unstable `Usage` type so a client can read either.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct TurnUsage {
+    tokens: crate::agent::agent_loop::message::TokenUsage,
+    /// Priced by the bridge and carried on `Done`; 0.0 for a model with no
+    /// known price.
+    cost_usd: f64,
+    /// Whether the provider reported usage at all.
+    reported: bool,
+}
+
+impl TurnUsage {
+    fn add(&mut self, input: u64, cached: u64, cache_creation: u64, output: u64) {
+        let t = &mut self.tokens;
+        t.input_tokens = t.input_tokens.saturating_add(input);
+        t.cached_input_tokens = t.cached_input_tokens.saturating_add(cached);
+        t.cache_creation_input_tokens =
+            t.cache_creation_input_tokens.saturating_add(cache_creation);
+        t.output_tokens = t.output_tokens.saturating_add(output);
+        self.reported = true;
+    }
+
+    /// `{"usage": {...}}` for the prompt response's `_meta`, or `None` when
+    /// the provider reported no usage (a slash command, or a provider that
+    /// sends none). `inputTokens` is the whole prompt whatever the provider's
+    /// convention, so cached tokens are a part of it, never added to it.
+    /// `provider_type` is the resolved provider type, not the session's
+    /// provider alias: the convention belongs to the backend.
+    fn meta(&self, provider_type: &str) -> Option<Meta> {
+        if !self.reported {
+            return None;
+        }
+        let input = self.tokens.prompt_total(Some(provider_type));
+        let output = self.tokens.output_tokens;
+        let usage = serde_json::json!({
+            "inputTokens": input,
+            "outputTokens": output,
+            "totalTokens": input.saturating_add(output),
+            "cachedReadTokens": self.tokens.cached_input_tokens,
+            "cachedWriteTokens": self.tokens.cache_creation_input_tokens,
+            "costUsd": self.cost_usd,
+        });
+        let mut meta = Meta::new();
+        meta.insert("usage".to_string(), usage);
+        Some(meta)
+    }
 }
 
 /// Wrap plain text as an `AgentMessageChunk` session notification. The base
@@ -1267,6 +1339,72 @@ mod tests {
     use std::sync::Mutex;
 
     static ACP_AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn prompt_usage_is_absent_when_the_provider_reported_none() {
+        let usage = TurnUsage {
+            cost_usd: 0.5,
+            ..TurnUsage::default()
+        };
+        assert_eq!(usage.meta("openai"), None);
+        let json = serde_json::to_value(
+            PromptResponse::new(StopReason::EndTurn).meta(usage.meta("openai")),
+        )
+        .unwrap();
+        assert!(json.get("_meta").is_none(), "{json}");
+    }
+
+    #[test]
+    fn prompt_usage_sums_every_call_into_meta_usage() {
+        let mut usage = TurnUsage::default();
+        usage.add(1_000, 800, 0, 50);
+        usage.add(1_200, 1_000, 0, 70);
+        usage.cost_usd = 0.0125;
+        let response = PromptResponse::new(StopReason::EndTurn).meta(usage.meta("openai"));
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            json["_meta"]["usage"],
+            serde_json::json!({
+                "inputTokens": 2_200,
+                "outputTokens": 120,
+                "totalTokens": 2_320,
+                "cachedReadTokens": 1_800,
+                "cachedWriteTokens": 0,
+                "costUsd": 0.0125,
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_usage_counts_anthropic_cached_tokens_into_the_input() {
+        // Anthropic reports input_tokens as the uncached remainder only.
+        let mut usage = TurnUsage::default();
+        usage.add(100, 9_000, 400, 30);
+        let meta = usage.meta("anthropic").unwrap();
+        assert_eq!(meta["usage"]["inputTokens"], 9_500);
+        assert_eq!(meta["usage"]["totalTokens"], 9_530);
+        assert_eq!(meta["usage"]["cachedReadTokens"], 9_000);
+        assert_eq!(meta["usage"]["cachedWriteTokens"], 400);
+    }
+
+    #[test]
+    fn prompt_usage_counts_cached_tokens_for_an_aliased_anthropic_provider() {
+        // The session's provider is an alias; the usage convention follows
+        // the provider type its entry declares.
+        let providers = std::collections::HashMap::from([(
+            "work-claude".to_string(),
+            crate::config::ProviderEntry {
+                provider_type: Some("anthropic".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let provider_type = crate::provider::provider_type_for_alias("work-claude", &providers);
+        let mut usage = TurnUsage::default();
+        usage.add(100, 9_000, 400, 30);
+        let meta = usage.meta(&provider_type).unwrap();
+        assert_eq!(meta["usage"]["inputTokens"], 9_500);
+        assert_eq!(meta["usage"]["totalTokens"], 9_530);
+    }
 
     struct TestDir(PathBuf);
 

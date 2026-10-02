@@ -16,6 +16,7 @@ For configuration keys and provider setup, see [config.md](config.md).
 | [spec-workflow.md](spec-workflow.md) | Spec-driven workflow — living specs, change deltas, task tracking, the `spec` tool + `/spec` command, SQLite storage |
 | [semantic.md](semantic.md) | Tree-sitter semantic code tools — symbols, definitions, callers/callees, per-language export detection |
 | [lsp.md](lsp.md) | LSP integration — inline diagnostics, built-in server set, workspace root resolution |
+| [acp.md](acp.md) | ACP agent server: per-prompt token usage and cost in `_meta.usage` |
 | [tui.md](tui.md) | Terminal UI — key bindings, inline avatar, tool-output display, theme |
 | [agent-loop.md](agent-loop.md) | Multi-turn agent execution loop — turn structure, hooks, stream pipeline, tool dispatch |
 | [failure-ladder.md](failure-ladder.md) | Tiered verification, progress/stall + turn-budget signals, safe-state abort, residual objectives |

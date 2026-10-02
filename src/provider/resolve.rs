@@ -78,6 +78,21 @@ pub fn default_model_for_alias(
     }
 }
 
+/// The provider TYPE behind a provider alias, resolving its entry from
+/// `providers` first. A custom alias (e.g. `work-claude` with
+/// `provider_type = "anthropic"`) names a backend whose behavior — the token
+/// usage convention, for one — follows the type, not the alias. Falls back to
+/// the alias itself, lowercased, when no entry is declared.
+pub fn provider_type_for_alias(alias: &str, providers: &HashMap<String, ProviderEntry>) -> String {
+    match providers
+        .get(alias)
+        .or_else(|| providers.get(&alias.to_ascii_lowercase()))
+    {
+        Some(entry) => Config::provider_type_of(alias, entry),
+        None => alias.to_ascii_lowercase(),
+    }
+}
+
 /// True when a `provider_type` string selects the OpenAI **Responses** API
 /// (`/v1/responses`) rather than chat/completions (#703). Both separators are
 /// accepted so a config typo (`openai_responses`) still works. The kind stays
