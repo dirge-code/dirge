@@ -4,6 +4,7 @@
 //! Each file exports `pub(crate)` function(s); `mod.rs` in parent `slash/`
 //! delegates to them via one-line match arms.
 
+pub(crate) mod addons;
 pub(crate) mod agent;
 pub(crate) mod allow;
 #[cfg(feature = "dap")]

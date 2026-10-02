@@ -57,6 +57,10 @@ pub(crate) enum SlashOutcome {
     /// `/wt-exit`: leave the worktree and return to the main repo.
     #[cfg(feature = "git-worktree")]
     DeferWtExit(cmd::wt_defer::WtExit),
+    /// An addon command or `/addons reload`: run the job off the event loop
+    /// and land its result there.
+    #[cfg(feature = "addons")]
+    DeferAddon(crate::ui::addon_phase::AddonJob),
 }
 
 #[cfg(feature = "slash-completion")]
@@ -68,6 +72,9 @@ pub use completion::register_plugin_commands;
 
 #[cfg(feature = "slash-completion")]
 pub use completion::register_alias_commands;
+
+#[cfg(all(feature = "slash-completion", feature = "addons"))]
+pub use completion::register_addon_commands;
 
 #[inline]
 pub(super) fn c_agent() -> Color {
@@ -714,6 +721,7 @@ pub async fn handle_slash(
             });
         }
         "/loop" => cmd::loop_cmd::cmd_loop(&mut ctx, &parts, text).await?,
+        "/addons" => return cmd::addons::cmd_addons(&mut ctx, &parts),
         "/prompt" => return cmd::prompt::cmd_prompt(&mut ctx, &parts).await,
         "/agent" | "/agents" => cmd::agent::cmd_agent(&mut ctx, &parts).await?,
         "/plan" => cmd::plan::cmd_plan(&mut ctx, &parts, text).await?,
@@ -825,6 +833,13 @@ pub async fn handle_slash(
                     return Ok(SlashOutcome::Handled);
                 }
             }
+            // Then commands Clojure addons registered (`:dirge/commands`).
+            #[cfg(feature = "addons")]
+            if let Some(host) = crate::addons::global()
+                && let Some(command) = host.command(parts[0].trim_start_matches('/'))
+            {
+                return Ok(cmd::addons::command_job(host, command, text));
+            }
             ctx.renderer.write_line(
                 &format!("unknown command: {} (try /help)", parts[0]),
                 c_error(),
@@ -860,6 +875,7 @@ fn compress_instructions(parts: &[&str]) -> Option<String> {
 /// feature.
 fn slash_commands() -> Vec<(&'static str, &'static str)> {
     let mut cmds = vec![
+        ("/addons", "list Clojure addons, or reload them in place"),
         ("/agent", "switch to a named agent, or turn agents off"),
         ("/agents", "list available agents"),
         ("/allow", "manage the session permission allowlist"),

@@ -221,6 +221,10 @@ pub(crate) struct UiState {
     /// Unconditional so the select! arm can be (select! rejects `#[cfg]` arms);
     /// stays `None` in non-worktree builds.
     pub(crate) wt_merge_phase: Option<crate::ui::wt_merge_phase::WtMergePhaseHandle>,
+    /// In-flight addon command or `/addons reload` (on a blocking thread);
+    /// the `addon_phase` arm lands its result. Stays `None` without the
+    /// `addons` feature.
+    pub(crate) addon_phase: Option<crate::ui::addon_phase::AddonPhaseHandle>,
 
     // ── PTY-backed interactive shell session (!cmd / !!cmd) ──────────
     /// A live PTY-backed shell session for `!cmd` / `!!cmd` (no terminal
@@ -461,6 +465,7 @@ impl UiState {
             review_phase: None,
             btw_phase: None,
             wt_merge_phase: None,
+            addon_phase: None,
             shell_session: None,
             shell_parser: None,
             shell_box_visible: false,

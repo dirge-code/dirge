@@ -1,0 +1,3 @@
+{:addon/id      "native"
+ :addon/init-ns "native.addon"
+ :addon/init-fn "addon-ctor"}

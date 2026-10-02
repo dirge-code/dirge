@@ -1,3 +1,4 @@
+pub mod addon_hooks;
 pub mod agent_loop;
 pub mod builder;
 pub mod capability_cards;
@@ -18,4 +19,6 @@ pub mod recovery;
 pub mod review;
 pub mod runner;
 pub mod session_digest;
+#[cfg(feature = "addons")]
+pub mod session_lifecycle;
 pub mod tools;

@@ -44,7 +44,7 @@ use super::build_session_search_tool;
 ///
 /// Single source of truth for the collision policy, previously inlined
 /// verbatim at three sites (MCP eager + MCP background + plugin) [dirge-p99h].
-#[cfg(any(feature = "mcp", feature = "plugin"))]
+/// Addon tools answer to it too.
 fn shadows_builtin(name: &str, source: &str) -> bool {
     if tools::reserves_builtin_name(name) {
         eprintln!(
@@ -1083,6 +1083,29 @@ pub async fn build_loop_tools(
                 tools.push(Arc::new(adapter));
                 plugin_tool_names.push(meta_name);
             }
+        }
+    }
+
+    // Clojure IAddon tools, after Janet plugin tools, under the rule
+    // `AnyAgent::upsert_loop_tools` applies on `/addons reload`: a built-in
+    // name always wins, and so does any tool registered above.
+    if let Some(addons) = crate::agent::addon_hooks::installed() {
+        let mut taken: std::collections::HashSet<String> =
+            tools.iter().map(|t| t.name().to_string()).collect();
+        for tool in addons.loop_tools(permission.clone(), ask_tx.clone()) {
+            let name = tool.name().to_string();
+            if shadows_builtin(&name, "addon") {
+                continue;
+            }
+            if !taken.insert(name.clone()) {
+                tracing::warn!(
+                    target: "dirge::addon",
+                    tool = %name,
+                    "addon tool skipped: another tool already uses that name"
+                );
+                continue;
+            }
+            tools.push(tool);
         }
     }
 

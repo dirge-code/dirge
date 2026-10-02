@@ -34,7 +34,11 @@ rustPlatform.buildRustPackage {
 
   src = source;
 
-  cargoLock.lockFile = ../Cargo.lock;
+  cargoLock = {
+    lockFile = ../Cargo.lock;
+    # The clojurust git crates are pinned by rev in Cargo.lock.
+    allowBuiltinFetchGit = true;
+  };
   nativeBuildInputs = [
     cmake
     # evil-janet generates bindings during the build; bindgenHook also
