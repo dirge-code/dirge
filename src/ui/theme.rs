@@ -13,6 +13,7 @@
 //! - `plain` — the pre-theme look (white assistant text, cyan accents).
 //!   Use this if green-on-black hurts your eyes or clashes with your
 //!   terminal background.
+//! - `ansi` — terminal palette indices 0–15, including pywal-managed palettes.
 //!
 //! ## Custom themes via `<name>.theme.json`
 //!
@@ -283,6 +284,31 @@ impl Theme {
             label: "PLAIN",
         }
     }
+
+    pub const fn ansi() -> Self {
+        Theme {
+            agent: Color::AnsiValue(15),
+            user: Color::AnsiValue(6),
+            user_input: Color::AnsiValue(15),
+            system: Color::AnsiValue(8),
+            tool: Color::AnsiValue(4),
+            perm: Color::AnsiValue(11),
+            result: Color::AnsiValue(7),
+            critic: Color::AnsiValue(5),
+            thinking: Color::AnsiValue(8),
+            error: Color::AnsiValue(9),
+            warn: Color::AnsiValue(11),
+            accent: Color::AnsiValue(12),
+            dim: Color::AnsiValue(8),
+            header: Color::AnsiValue(14),
+            divider: Color::AnsiValue(8),
+            banner_primary: Color::AnsiValue(12),
+            banner_secondary: Color::AnsiValue(8),
+            background: Color::Reset,
+            input_bg: Color::Reset,
+            label: "ANSI",
+        }
+    }
 }
 
 /// JSON shape for `<name>.theme.json` overrides. Every field is
@@ -431,7 +457,7 @@ impl ThemeJson {
 static THEME: OnceLock<Theme> = OnceLock::new();
 
 /// Initialize the global theme from a name. Resolution order:
-/// 1. Built-in: `phosphor` (default), `plain`.
+/// 1. Built-in: `phosphor` (default), `plain`, `ansi`.
 /// 2. Custom JSON: `~/.config/dirge/<name>.theme.json`. Fields not
 ///    present in the file inherit from phosphor — minimal overrides
 ///    are encouraged (e.g. `{"accent": "magenta"}`).
@@ -442,6 +468,7 @@ pub fn init(name: &str) {
     let theme = match name.to_ascii_lowercase().as_str() {
         "phosphor" | "" => Theme::phosphor(),
         "plain" => Theme::plain(),
+        "ansi" => Theme::ansi(),
         other => load_custom_theme(other).unwrap_or_else(|err| {
             eprintln!(
                 "warning: theme '{}' could not be loaded ({}); using phosphor.\n\
@@ -715,6 +742,39 @@ mod tests {
     fn presets_are_distinct() {
         assert_ne!(Theme::phosphor().agent, Theme::plain().agent);
         assert_ne!(Theme::phosphor().accent, Theme::plain().accent);
+    }
+
+    #[test]
+    fn ansi_preset_uses_terminal_palette() {
+        let t = Theme::ansi();
+        assert_eq!(t.label, "ANSI");
+        assert_eq!(t.agent, Color::AnsiValue(15));
+        assert_eq!(t.user, Color::AnsiValue(6));
+        assert_eq!(t.error, Color::AnsiValue(9));
+        assert_eq!(t.warn, Color::AnsiValue(11));
+        assert_eq!(t.background, Color::Reset);
+        assert_eq!(t.input_bg, Color::Reset);
+        for color in [
+            t.agent,
+            t.user,
+            t.user_input,
+            t.system,
+            t.tool,
+            t.perm,
+            t.result,
+            t.critic,
+            t.thinking,
+            t.error,
+            t.warn,
+            t.accent,
+            t.dim,
+            t.header,
+            t.divider,
+            t.banner_primary,
+            t.banner_secondary,
+        ] {
+            assert!(matches!(color, Color::AnsiValue(0..=15)));
+        }
     }
 
     /// #628: every shipped preset keeps a dark input surface so the white
