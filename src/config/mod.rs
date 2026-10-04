@@ -1192,8 +1192,8 @@ pub struct Config {
     /// which replies ALLOW/DENY instead of asking the human. Unset
     /// (default) = human prompts as usual. See docs/permissions.md.
     pub approval_provider: Option<String>,
-    /// UI color theme. Known built-in values: `phosphor` (default,
-    /// 80s CRT green) and `plain` (white/cyan).
+    /// UI color theme. Built-ins: `phosphor` (default, 80s CRT green),
+    /// `plain` (white/cyan), and `ansi` (terminal palette, including pywal).
     ///
     /// Any other value looks for a custom theme file at
     /// `~/.config/dirge/<theme>.theme.json` — see the

@@ -1,24 +1,32 @@
 # Custom themes
 
-dirge ships two built-in palettes and supports user-defined themes
+dirge ships three built-in palettes and supports user-defined themes
 via JSON files in `~/.config/dirge/`.
 
 ## Built-ins
 
 - `phosphor` (default) — 80s CRT green. Errors red, warnings yellow.
 - `plain` — white assistant text, cyan accents, gray dim.
+- `ansi` — terminal palette colors 0–15, so a pywal palette can color the UI.
+  Uses the terminal's default background, including in the input box.
 
 Switch via `theme` in `~/.config/dirge/config.json`:
 
 ```json
 {
-  "theme": "plain"
+  "theme": "ansi"
 }
 ```
 
+Dirge reads this setting at startup; restart Dirge to switch themes. With
+`ansi` selected, foregrounds use terminal palette indices rather than fixed
+RGB values, so terminal-side palette updates (for example, pywal applying
+colors to the running terminal) can change their appearance without changing
+Dirge's config. Terminal support and when existing cells repaint vary.
+
 ## Custom themes
 
-Any value other than `phosphor` / `plain` is treated as the stem
+Any value other than `phosphor` / `plain` / `ansi` is treated as the stem
 of a theme file: dirge looks for
 `~/.config/dirge/<name>.theme.json`. If found, its color fields
 **override the phosphor preset**; anything not present in the
@@ -100,7 +108,7 @@ Each color field accepts three forms:
 | `banner_primary` | Welcome banner primary stroke |
 | `banner_secondary` | Welcome banner border / decorations |
 | `background` | Terminal background fill, painted behind every cell (foregrounds preserved). Use `"reset"` to keep the terminal's own background — that's the `plain` default; `phosphor` uses a near-black `#222222`. |
-| `input_bg` | Background of the bottom input box, painted over `background`. Keeps the composer a dark field so `user_input` (white) stays readable even on a light terminal / light theme. Both presets default to `#222222`; use `"reset"` to opt out and match `background`. |
+| `input_bg` | Background of the bottom input box, painted over `background`. Keeps the composer a dark field so `user_input` (white) stays readable even on a light terminal / light theme. `phosphor` and `plain` default to `#222222`; `ansi` uses the terminal background. Use `"reset"` to opt out and match `background`. |
 | `label` | Human-readable name shown in the banner |
 
 ### Activating
