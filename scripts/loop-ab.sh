@@ -58,7 +58,7 @@ set -euo pipefail
 #   -B  treatment arm overrides    (default: none)
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
-#   -s  scenario small|recon|recon-real|edit-large|denied|pinned|compact|handoff|handoff-fold  (default small)
+#   -s  scenario small|recon|recon-real|edit-large|denied|pinned|compact|handoff|handoff-fold|fold-chain  (default small)
 #   -C  extra arm "name:k=v,k=v" — repeatable. Reaches the N-arm reporting
 #       that already existed with no CLI route to it.
 #
@@ -114,7 +114,11 @@ EXTRA_ARGS=""
 # Config a SCENARIO pins across every arm, same "k=v,k=v" form as -A/-B.
 SCENARIO_OVERRIDES=""
 
-BASE_CONFIG="${HOME}/.config/dirge/config.json"
+# LOOP_AB_BASE_CONFIG replaces the global config as the base every arm is built
+# from. A personal config can carry MCP servers, hooks and provider routes that
+# enter every arm's prompt and tool surface; a pinned minimal base keeps them
+# out and makes the run reproducible on another machine.
+BASE_CONFIG="${LOOP_AB_BASE_CONFIG:-${HOME}/.config/dirge/config.json}"
 
 while getopts "n:m:A:B:C:b:t:s:" opt; do
   case "$opt" in
@@ -126,11 +130,11 @@ while getopts "n:m:A:B:C:b:t:s:" opt; do
     t) MAXTURNS="$OPTARG" ;;
     s) SCENARIO="$OPTARG" ;;
     C) ARMS+=("$OPTARG") ;;
-    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied|pinned|compact|handoff|handoff-fold]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied|pinned|compact|handoff|handoff-fold|fold-chain]" >&2; exit 2 ;;
   esac
 done
 
-case "$SCENARIO" in small|recon|recon-real|edit-large|denied|pinned|compact|handoff|handoff-fold) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, denied, pinned, compact, handoff, or handoff-fold" >&2; exit 2 ;; esac
+case "$SCENARIO" in small|recon|recon-real|edit-large|denied|pinned|compact|handoff|handoff-fold|fold-chain) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, denied, pinned, compact, handoff, handoff-fold, or fold-chain" >&2; exit 2 ;; esac
 [ "$REPEATS" -ge 1 ] 2>/dev/null || { echo "error: -n must be a positive integer" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "error: dirge binary not found/executable: $BINARY (cargo build first)" >&2; exit 1; }
@@ -727,6 +731,78 @@ elif [ "$SCENARIO" = "compact" ]; then
     done
     echo 1
   }
+elif [ "$SCENARIO" = "fold-chain" ]; then
+  # fold-chain: a long-horizon task whose answer depends on facts that are
+  # FOLDED AWAY mid-run. Built as the baseline instrument for context-economy
+  # work (docs/context-economy-baseline.md).
+  #
+  # WHY `compact` IS NOT ENOUGH. Its eight files can be read in one parallel
+  # turn; a capable model does exactly that, answers on turn two, and never
+  # reaches the fold threshold (measured: 2 turns, 0 compactions). A scenario
+  # that only folds for models that happen to read serially measures reading
+  # style, not compaction.
+  #
+  # SHAPE. A pointer chain: each file names the next one, under a name that
+  # cannot be guessed, so the reads are forced to be sequential: one turn per
+  # file. Each file carries one VALUE line. The answer is the sum of all
+  # values, so every value read before a fold must survive that fold (in the
+  # summary or in the protected tail) for the run to pass. Nothing may be
+  # written, so the model cannot park the values on disk.
+  #
+  # SIZE. Each file stays under the aggressive per-result cap (1000 tokens
+  # past 0.60 of the budget), so no value is lost to result truncation: a
+  # loss here is a loss to the fold. FOLD_CHAIN_LEN and FOLD_CHAIN_TARGET are
+  # the two levers; the defaults were calibrated to produce two or more folds
+  # per run on a ~12k-token fixed overhead (system prompt + tool schemas).
+  CHAIN_LEN="${FOLD_CHAIN_LEN:-24}"
+  SCENARIO_OVERRIDES="context_target=${FOLD_CHAIN_TARGET:-26000}"
+  NEEDS_COMPACTION=1
+  mkdir -p "$FIXTURE/notes"
+  chain_name() { printf 'n%s' "$(printf 'fold-chain-%s' "$1" | sha256sum | cut -c1-10)"; }
+  # Hash-derived, not arithmetic: a formula-generated sequence lets a model
+  # extrapolate values it no longer holds, which would score a lossy fold as
+  # a pass.
+  chain_value() { echo $(( 16#$(printf 'fold-chain-value-%s' "$1" | sha256sum | cut -c1-6) % 900 + 100 )); }
+  EXPECTED_SUM=0
+  for k in $(seq 1 "$CHAIN_LEN"); do
+    f="$FIXTURE/notes/$(chain_name "$k").txt"
+    v="$(chain_value "$k")"
+    EXPECTED_SUM=$(( EXPECTED_SUM + v ))
+    {
+      echo "# ledger page $k"
+      # Incompressible, distinct filler: each line is a digest of (page,line),
+      # so no page repeats another and none can be answered from a pattern.
+      for l in $(seq 1 16); do
+        printf 'entry %02d.%02d audit=%s status=reconciled\n' "$k" "$l" \
+          "$(printf 'fold-chain-%s-%s' "$k" "$l" | sha256sum | cut -c1-24)"
+      done
+      echo "VALUE = $v"
+      if [ "$k" -lt "$CHAIN_LEN" ]; then
+        echo "NEXT = notes/$(chain_name $((k + 1))).txt"
+      else
+        echo "NEXT = END"
+      fi
+    } > "$f"
+  done
+  CHAIN_START="notes/$(chain_name 1).txt"
+  cp -a "$FIXTURE/notes" "$WORK/fold-chain-pristine"
+  FIXTURE_DESC="pointer chain of $CHAIN_LEN ledger pages, context_target=${FOLD_CHAIN_TARGET:-26000}"
+  TASK="Start by reading $CHAIN_START. Every page has a line \"VALUE = <number>\" and a line \"NEXT = <path>\" naming the next page to read; keep following NEXT until it says END. Read every page in the chain. Do not create or modify any file. When you reach END, report the total of all the VALUE numbers you read. End your answer with a line: SUM=<total>"
+
+  # Correct = the exact total AND the tree untouched (no scratch files: a run
+  # that parked the values on disk bypassed the thing being measured).
+  check_correct() {
+    local out="$1" result got n
+    result="$(jq -r 'select(.type=="result") | .result' "$out" 2>/dev/null || true)"
+    got="$(printf '%s' "$result" | grep -oE 'SUM=[0-9]+' | tail -1 || true)"
+    [ "$got" = "SUM=$EXPECTED_SUM" ] || { echo 0; return; }
+    # The chain must be byte-identical, and nothing else may exist outside
+    # dirge's own session state (.dirge/).
+    diff -rq "$WORK/fold-chain-pristine" "$FIXTURE/notes" >/dev/null 2>&1 || { echo 0; return; }
+    n="$(find "$FIXTURE" -type f -not -path "$FIXTURE/notes/*" -not -path "$FIXTURE/.dirge/*" | wc -l | tr -d ' ')"
+    [ "$n" = "0" ] || { echo 0; return; }
+    echo 1
+  }
 fi
 
 # ---- Undo whatever a run wrote, so each repeat starts from the same tree.
@@ -751,6 +827,11 @@ reset_fixture() {
     if [ -f "$FIXTURE/src/config.py.pristine" ]; then
       cp -f "$FIXTURE/src/config.py.pristine" "$FIXTURE/src/config.py"
     fi
+  elif [ "$SCENARIO" = "fold-chain" ]; then
+    # Drop anything a run wrote and restore the chain, so a run that edited a
+    # page or left a scratch file cannot leak into the next repeat.
+    rm -rf "${FIXTURE:?}"/* "$FIXTURE"/.[!.]* 2>/dev/null || true
+    cp -a "$WORK/fold-chain-pristine" "$FIXTURE/notes"
   elif [ "$SCENARIO" = "handoff" ] || [ "$SCENARIO" = "handoff-fold" ]; then
     # out.txt IS the dependent variable. Without this reset the second repeat
     # starts with the first repeat's entry already present, every run scores
@@ -944,10 +1025,11 @@ build_config() { # $1 = cfgdir, $2 = overrides, $3 = model
 # prologue_nudges  nudges_total  capability_tier  boundaries  gates_total
 # input_tokens  cached_tokens  cache_creation_tokens  session_found
 # denied_tool_attempts  compactions  errored_missing_info  unresolved_effects
+# hallucinated_names  dropped_names  aliased_names  output_tokens
 run_arm() { # $1 = overrides, $2 = tag, $3 = model
   local i cfgdir datadir out err logfile tracefile ok tally_str
   local gates_line tally_found turns tool_calls_f errored err_missing unresolved scavenged storm maxstreak rep_invalid rep_total verification fw
-  local sess sess_found in_tok cached_tok create_tok
+  local sess sess_found in_tok cached_tok create_tok out_tok
   for i in $(seq 1 "$REPEATS"); do
     cfgdir="$(mktemp -d "$WORK/cfg.XXXXXX")"
     datadir="$(mktemp -d "$WORK/data.XXXXXX")"
@@ -1071,19 +1153,20 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       in_tok="$(jq -r '.cumulative_input_tokens // 0' "$sess" 2>/dev/null || echo 0)"
       cached_tok="$(jq -r '.cumulative_cached_input_tokens // 0' "$sess" 2>/dev/null || echo 0)"
       create_tok="$(jq -r '.cumulative_cache_creation_tokens // 0' "$sess" 2>/dev/null || echo 0)"
+      out_tok="$(jq -r '.cumulative_output_tokens // 0' "$sess" 2>/dev/null || echo 0)"
     else
-      sess_found=0; in_tok=0; cached_tok=0; create_tok=0
+      sess_found=0; in_tok=0; cached_tok=0; create_tok=0; out_tok=0
     fi
 
     # Col 20 (gates_fired) is APPENDED so columns 1..19 keep their meaning —
     # an older results.tsv still reports, it just has no gate column. Cols
     # 21..24 (tokens, cache, session_found) are appended for the same reason.
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
       "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" "$gates_total" \
       "$in_tok" "$cached_tok" "$create_tok" "$sess_found" "$denied_n" "$compactions" \
-      "$err_missing" "$unresolved" "$halluc" "$dropped" "$aliased" \
+      "$err_missing" "$unresolved" "$halluc" "$dropped" "$aliased" "$out_tok" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
