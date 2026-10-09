@@ -5,3 +5,11 @@ reason = "fxhash is a transitive dep of bm25; no maintained fork exists that pre
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0384"
 reason = "instant is a transitive dep of notify-types → notify (dirge's watch dep); unmaintained, no drop-in fork yet — notify maintainers are tracking web-time migration"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0089"
+reason = "atomic-polyfill (unmaintained, no vulnerability) is a transitive dep of cljrs-ir via postcard -> heapless 0.7; only in builds with the addons feature"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2020-0168"
+reason = "mach (unmaintained, no vulnerability) is a transitive dep of cljrs-gc via system-memory; only in builds with the addons feature"

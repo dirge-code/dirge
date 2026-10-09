@@ -98,7 +98,7 @@ pub fn is_live() -> bool {
 
 /// Tools that must never be reached from a plugin, independent of the
 /// plugin-registered check below.
-const NEVER_CALLABLE: &[&str] = &[
+pub(crate) const NEVER_CALLABLE: &[&str] = &[
     // Subagents run isolated — no tool access, no plugin hooks (see
     // docs/plugins.md). Reaching one from inside a plugin would smuggle a
     // whole agent run behind that boundary.
@@ -191,13 +191,32 @@ async fn dispatch(name: &str, args_json: &str) -> Result<String, String> {
     } else {
         serde_json::from_str(args_json).map_err(|e| format!("arguments are not valid JSON: {e}"))?
     };
+    execute_in(&snapshot(), name, args, "plugin-call-tool").await
+}
+
+/// The tool set the agent was last built with.
+#[cfg_attr(not(feature = "addons"), allow(dead_code))]
+pub(crate) fn live_tools() -> Vec<Arc<dyn LoopTool>> {
+    snapshot()
+}
+
+/// Run `name` from `tools` with JSON object `args`, bypassing the loop's
+/// hooks, and answer its content as text. The caller applies its own
+/// refusal policy first. `call_id` names the invocation in the tool's logs.
+pub(crate) async fn execute_in(
+    tools: &[Arc<dyn LoopTool>],
+    name: &str,
+    args: Value,
+    call_id: &str,
+) -> Result<String, String> {
     if !args.is_object() {
         return Err("arguments must be a JSON object".to_string());
     }
 
-    let tool = snapshot()
-        .into_iter()
+    let tool = tools
+        .iter()
         .find(|t| t.name() == name)
+        .cloned()
         .ok_or_else(|| format!("no tool named '{name}'"))?;
 
     let args = tool.prepare_arguments(args);
@@ -206,7 +225,7 @@ async fn dispatch(name: &str, args_json: &str) -> Result<String, String> {
     let on_update: LoopToolUpdate = Arc::new(|_: &LoopToolResult| {});
 
     match tool
-        .execute("plugin-call-tool", args, AbortSignal::new(), on_update)
+        .execute(call_id, args, AbortSignal::new(), on_update)
         .await
     {
         Ok(result) => Ok(flatten(&result)),

@@ -1,0 +1,4 @@
+{:addon/id          "foreign"
+ :addon/init-ns     "foreign.addon"
+ :addon/init-fn     "addon-ctor"
+ :addon/protocol-ns "fixture.addon-protocol"}

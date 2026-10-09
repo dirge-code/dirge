@@ -1,0 +1,3 @@
+{:addon/id      "layered"
+ :addon/init-ns "layered.addon"
+ :addon/init-fn "addon-ctor"}

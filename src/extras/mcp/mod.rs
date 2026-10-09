@@ -266,6 +266,15 @@ impl McpClientManager {
             .collect()
     }
 
+    /// Whether `server`'s config sets `allow_external_paths`; false for a
+    /// server it has no config for.
+    #[cfg_attr(not(feature = "addons"), allow(dead_code))]
+    pub fn allows_external_paths(&self, server: &str) -> bool {
+        self.configs
+            .get(server)
+            .is_some_and(config::McpServerConfig::allow_external_paths)
+    }
+
     /// Names of servers whose initial `connect` failed (GH #541). The
     /// info panel renders these as broken (`○`) alongside healthy ones,
     /// so a misconfigured or timed-out server is visible instead of

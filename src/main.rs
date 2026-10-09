@@ -1,3 +1,5 @@
+#[cfg(feature = "addons")]
+mod addons;
 mod agent;
 mod auth;
 /// Shared spawn hardening (setsid + process-group SIGKILL guard) for the
@@ -582,6 +584,20 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::load();
 
     crate::agent::command_hooks::install_from_config(&cfg);
+    // Clojure IAddons: discovered and loaded before the agent is built, so
+    // their tools and hooks are part of the first run.
+    #[cfg(feature = "addons")]
+    crate::addons::install_from_config(&cfg);
+    // The addons hear each session start and end, including through a host
+    // `/addons reload` starts later.
+    #[cfg(feature = "addons")]
+    crate::addons::lifecycle::install(&cfg.addons.clone().unwrap_or_default());
+    // The agent reaches the addons' tools and hooks through this port, which
+    // finds the host a later `/addons reload` starts as well.
+    #[cfg(feature = "addons")]
+    crate::agent::addon_hooks::install(std::sync::Arc::new(
+        crate::addons::loop_hooks::LiveAddonHooks,
+    ));
     crate::compression::init_from_config(cfg.compression.clone().unwrap_or_default());
     crate::compression::set_cli_disabled(cli.no_compression);
     crate::prompt_cache::init_from_config(cfg.prompt_cache.as_ref().and_then(|c| c.ttl.as_deref()));
@@ -1480,6 +1496,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "loop"))]
         let loop_mode = false;
         if !cli.resolve_no_tools(&cfg) && (cli.print || loop_mode) {
+            // Published to addons once the permission checker exists, below.
             Some(extras::mcp::McpClientManager::connect_all(servers).await)
         } else {
             None
@@ -1635,6 +1652,12 @@ async fn main() -> anyhow::Result<()> {
     // first opportunity to wire it into the now-existing checker
     // (the checker is built inside `build_channels`).
     crate::permission::apply_prompt_deny(&permission, &context.current_prompt_deny_tools);
+    // Addon code reaches the headless path's MCP connections through
+    // `dirge.harness/mcp-call`, refused where this checker denies.
+    #[cfg(all(feature = "addons", feature = "mcp"))]
+    if let Some(mgr) = &mcp_manager {
+        crate::addons::mcp::publish(mgr, permission.clone());
+    }
 
     // dirge-0g6i: wire optional LLM auto-approval. When `approval_provider`
     // is set, a permission prompt is judged by that model instead of the
@@ -1770,7 +1793,11 @@ async fn main() -> anyhow::Result<()> {
         // it down here. The interactive path instead hands its manager to
         // run_interactive, which owns the shutdown; the old shared
         // post-run shutdown is gone because `mcp_manager` is conditionally
-        // moved into run_interactive and can't be named afterward.
+        // moved into run_interactive and can't be named afterward. The
+        // session ends first, while its listeners can still reach MCP.
+        #[cfg(feature = "addons")]
+        crate::agent::session_lifecycle::end(crate::agent::session_lifecycle::EndCause::Print)
+            .await;
         #[cfg(feature = "mcp")]
         if let Some(mgr) = mcp_manager {
             mgr.shutdown().await;
@@ -2074,8 +2101,16 @@ async fn main() -> anyhow::Result<()> {
             let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             let perm = permission.clone();
             let ask = ask_tx.clone();
+            // A session starting before the servers connect waits for them,
+            // within a bound, so its addon listeners can reach them.
+            #[cfg(feature = "addons")]
+            crate::addons::mcp::expect();
             tokio::spawn(async move {
                 let mgr = extras::mcp::McpClientManager::connect_all(&servers).await;
+                // Addon code reaches the same connections through
+                // `dirge.harness/mcp-call`, refused where this checker denies.
+                #[cfg(feature = "addons")]
+                crate::addons::mcp::publish(&mgr, perm.clone());
                 let mcp_tools = mgr.collect_tools(perm, ask).await;
                 let wrapped = crate::agent::builder::wrap_mcp_tools(mcp_tools).await;
                 // Deliver the payload, then nudge the UI loop to drain it.
@@ -2390,6 +2425,9 @@ async fn main() -> anyhow::Result<()> {
         // adapter + debuggee can be orphaned in their own process group.
         #[cfg(feature = "dap")]
         crate::dap::session::shutdown_active_session().await;
+        // IAddon `shutdown!` for every loaded addon, newest first.
+        #[cfg(feature = "addons")]
+        crate::addons::shutdown();
         // dirge-x949: MCP shutdown moved INTO run_interactive — for the
         // interactive path the connected manager is now owned there
         // (delivered by the background loader), so it shuts the servers

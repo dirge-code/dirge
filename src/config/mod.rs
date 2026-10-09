@@ -631,6 +631,57 @@ pub struct PluginSettings {
     pub auto_start: Option<bool>,
 }
 
+/// The `addons` key: the Clojure IAddon host (cargo feature `addons`).
+/// Absent = enabled whenever a manifest is found in `.dirge/addons/` or
+/// `~/.config/dirge/addons/`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AddonsConfig {
+    /// `false` loads no addons. Default true.
+    pub enabled: Option<bool>,
+    /// Extra directories searched for `META-INF/addons/*.edn`.
+    pub paths: Vec<String>,
+    /// Further directory names under `META-INF` that hold manifests,
+    /// beside `addons` and `hive-addons`.
+    pub manifest_dirs: Vec<String>,
+    /// Extra source roots on the addon classpath (e.g. the `src` of the
+    /// IAddon protocol library), before `DIRGE_ADDON_PATH`.
+    pub source_paths: Vec<String>,
+    /// Namespace defining the IAddon protocol functions (`addon?`,
+    /// `initialize!`, `shutdown!`, `tools`, optionally `hooks` and `health`).
+    /// Absent = the manifests' `:addon/protocol-ns`, else the embedded
+    /// `hive-addon.protocol`.
+    pub protocol_ns: Option<String>,
+    /// Seconds a prompt's run waits for `:dirge/session-start` answers
+    /// before it opens without them. Default 30.
+    pub session_start_timeout_secs: Option<u64>,
+    /// Seconds dirge waits for `:dirge/session-end` before it goes on (and,
+    /// on exit, closes the MCP servers). Default 10.
+    pub session_end_timeout_secs: Option<u64>,
+    /// An nREPL server inside the addon runtime (cargo feature
+    /// `addons-nrepl`). Absent = no server, unless `DIRGE_ADDON_NREPL` asks.
+    pub nrepl: Option<AddonsNreplConfig>,
+    /// After an nREPL evaluation or `dirge.harness/refresh!`, read every
+    /// addon's tools, hooks and commands again and hand the changes to the
+    /// running agent. Default true.
+    pub live_refresh: Option<bool>,
+}
+
+/// The `addons.nrepl` key.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AddonsNreplConfig {
+    /// `false` starts no server. Default true once the key is present.
+    pub enabled: Option<bool>,
+    /// Port to listen on; 0 (the default) lets the OS pick one.
+    pub port: Option<u16>,
+    /// Address to bind. Default `127.0.0.1`.
+    pub bind: Option<String>,
+    /// File the bound port is written to, relative to the working directory.
+    /// Default `.dirge/addons/.nrepl-port`; `""` writes none.
+    pub port_file: Option<String>,
+}
+
 /// Prompt-compression engine config. Disabled → no compression. Enabled with
 /// no preset → the "dirge" default (lossless transforms + tool-output
 /// windowing, no output-shaping). Other presets (e.g. `"agent"`,
@@ -977,6 +1028,9 @@ pub struct Config {
     /// the `.janet` file stem under a plugin search dir). Absent entry =
     /// enabled, not auto-started (backward compatible).
     pub plugins: Option<HashMap<String, PluginSettings>>,
+    /// Clojure IAddon host settings (cargo feature `addons`). Absent =
+    /// load every addon found in the default search directories.
+    pub addons: Option<AddonsConfig>,
     /// Claude-Code-compatible command hooks: the same shape as the `hooks`
     /// key of Claude Code's `settings.json` (event name to matcher groups
     /// of `{ "type": "command", "command", "timeout" }`). Absent = none.

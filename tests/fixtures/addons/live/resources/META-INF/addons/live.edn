@@ -1,0 +1,3 @@
+{:addon/id      "live"
+ :addon/init-ns "live.addon"
+ :addon/init-fn "addon-ctor"}
