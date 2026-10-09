@@ -365,6 +365,11 @@ pub(crate) enum AnyAgentInner {
             compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
+    Opper(
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
+        >,
+    ),
     Custom(
         openai::completion::CompletionModel<
             compressing_http::CompressingHttpClient<reqwest::Client>,
@@ -893,6 +898,7 @@ impl AnyAgent {
             AnyAgentInner::Kimi(_) => "kimi",
             AnyAgentInner::Ollama(_) => "ollama",
             AnyAgentInner::Requesty(_) => "requesty",
+            AnyAgentInner::Opper(_) => "opper",
             AnyAgentInner::Custom(_) => "custom",
         }
     }

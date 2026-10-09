@@ -25,6 +25,7 @@ pub enum ProviderKind {
     OpenCode,
     Kimi,
     Requesty,
+    Opper,
     Custom,
 }
 
@@ -46,6 +47,7 @@ pub fn default_model_for(provider_name: &str) -> &'static str {
         Some(ProviderKind::Kimi) => "k3",
         Some(ProviderKind::Ollama) => "llama3",
         Some(ProviderKind::Requesty) => "openai/gpt-4o-mini",
+        Some(ProviderKind::Opper) => "claude-sonnet-4-6",
         // OpenRouter + Custom + unknown — keep the historical default
         // since OpenRouter wants the `vendor/model` form.
         _ => "deepseek/deepseek-v4-flash",
@@ -123,6 +125,7 @@ pub fn parse_provider(name: &str) -> Option<ProviderKind> {
         "kimi" | "kimi-code" | "moonshot" => Some(ProviderKind::Kimi),
         "ollama" => Some(ProviderKind::Ollama),
         "requesty" => Some(ProviderKind::Requesty),
+        "opper" => Some(ProviderKind::Opper),
         "custom" => Some(ProviderKind::Custom),
         _ => None,
     }
@@ -378,6 +381,7 @@ fn kind_label(kind: ProviderKind) -> &'static str {
         ProviderKind::OpenCode => "opencode",
         ProviderKind::Kimi => "kimi",
         ProviderKind::Requesty => "requesty",
+        ProviderKind::Opper => "opper",
         ProviderKind::Custom => "custom",
     }
 }
@@ -539,6 +543,7 @@ const BUILTIN_PROVIDER_NAMES: &[&str] = &[
     "ollama",
     "openrouter",
     "requesty",
+    "opper",
     "custom",
 ];
 
@@ -687,6 +692,7 @@ fn provider_env_var(kind: ProviderKind) -> &'static str {
         ProviderKind::Ollama => "OLLAMA_API_KEY",
         ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
         ProviderKind::Requesty => "REQUESTY_API_KEY",
+        ProviderKind::Opper => "OPPER_API_KEY",
         ProviderKind::Custom => "CUSTOM_API_KEY",
     }
 }
@@ -987,6 +993,34 @@ mod requesty_identity_tests {
                 .iter()
                 .all(|(_, provider)| *provider != "requesty"),
             "Requesty must be selected explicitly",
+        );
+    }
+}
+
+#[cfg(test)]
+mod opper_identity_tests {
+    use super::*;
+
+    #[test]
+    fn opper_parses_case_insensitively_and_defaults_to_a_pool_model() {
+        for name in ["opper", "OPPER", "OpPeR"] {
+            assert_eq!(
+                parse_provider(name).map(kind_label),
+                Some("opper"),
+                "provider name {name:?} should resolve canonically",
+            );
+        }
+        assert_eq!(default_model_for("opper"), "claude-sonnet-4-6");
+        assert_eq!(provider_env_var(ProviderKind::Opper), "OPPER_API_KEY");
+    }
+
+    #[test]
+    fn opper_is_not_autodetected() {
+        assert!(
+            PROVIDER_AUTODETECT_ORDER
+                .iter()
+                .all(|(_, provider)| *provider != "opper"),
+            "Opper must be selected explicitly",
         );
     }
 }

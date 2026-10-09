@@ -137,6 +137,12 @@ pub fn reasoning_profile(provider: Option<&str>, model: Option<&str>) -> Reasoni
             effort: EffortWire::TopLevelStandardEffort,
             disable: DisableWire::None,
         },
+        // Opper's OpenAI-compatible API takes a top-level `reasoning_effort` (its
+        // model catalogue lists that as the reasoning wire), the Requesty shape.
+        Some("opper") => ReasoningProfile {
+            effort: EffortWire::TopLevelStandardEffort,
+            disable: DisableWire::None,
+        },
         Some("openai") => ReasoningProfile {
             effort: EffortWire::NestedEffort,
             disable: DisableWire::None,
@@ -575,6 +581,11 @@ mod tests {
             ),
             (
                 "requesty",
+                EffortWire::TopLevelStandardEffort,
+                DisableWire::None,
+            ),
+            (
+                "opper",
                 EffortWire::TopLevelStandardEffort,
                 DisableWire::None,
             ),
@@ -1160,6 +1171,32 @@ mod max_tokens_tests {
                 params,
                 serde_json::json!({ "reasoning_effort": expected }),
                 "unexpected Requesty params for {level:?}",
+            );
+            assert!(params.get("reasoning").is_none());
+        }
+
+        assert_eq!(profile.effort_params(ThinkingLevel::Off, None), None);
+        assert_eq!(profile.disable_params(), None);
+    }
+
+    #[test]
+    fn opper_uses_standard_top_level_effort_without_disable_knob() {
+        let profile = reasoning_profile(Some("opper"), None);
+        for (level, expected) in [
+            (ThinkingLevel::Minimal, "low"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Xhigh, "high"),
+            (ThinkingLevel::Max, "high"),
+        ] {
+            let params = profile
+                .effort_params(level, None)
+                .expect("enabled Opper reasoning should produce params");
+            assert_eq!(
+                params,
+                serde_json::json!({ "reasoning_effort": expected }),
+                "unexpected Opper params for {level:?}",
             );
             assert!(params.get("reasoning").is_none());
         }

@@ -252,6 +252,7 @@ fn resolve_provider_base_url(
         ProviderKind::Cerebras => (None, Some("https://api.cerebras.ai/v1")),
         ProviderKind::OpenCode => (None, Some("https://opencode.ai/zen/v1")),
         ProviderKind::Requesty => (None, Some("https://router.requesty.ai/v1")),
+        ProviderKind::Opper => (None, Some("https://api.opper.ai/v3/compat")),
         ProviderKind::Kimi => (
             Some("KIMI_CODE_BASE_URL"),
             Some(crate::auth::kimi_device::KIMI_CODE_BASE_URL),
@@ -317,7 +318,7 @@ where
     } = request_context;
     let info = resolve_provider_info(provider_name, providers).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, deepseek, glm, cerebras, opencode, kimi, ollama, requesty, custom",
+            "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, deepseek, glm, cerebras, opencode, kimi, ollama, requesty, opper, custom",
             provider_name
         )
     })?;
@@ -680,6 +681,14 @@ where
                 .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
             Ok(AnyClient::Requesty(b.build()?))
+        }
+        ProviderKind::Opper => {
+            let b = openai::CompletionsClient::builder()
+                .http_client(compressing(reqwest::Client::new(), ProviderKind::Opper))
+                .api_key(&key)
+                .base_url(require_base_url(info.kind, base_url.as_deref())?)
+                .http_headers(headers);
+            Ok(AnyClient::Opper(b.build()?))
         }
         ProviderKind::Custom => {
             let base_url = base_url.ok_or_else(|| {
@@ -1120,6 +1129,7 @@ fn wire_kind(kind: ProviderKind) -> crate::llmtrim::ir::ProviderKind {
         | ProviderKind::OpenCode
         | ProviderKind::Kimi
         | ProviderKind::Requesty
+        | ProviderKind::Opper
         | ProviderKind::Custom => Wire::OpenAi,
     }
 }
@@ -1387,6 +1397,7 @@ mod tests {
             (ProviderKind::Cerebras, "https://api.cerebras.ai/v1"),
             (ProviderKind::OpenCode, "https://opencode.ai/zen/v1"),
             (ProviderKind::Requesty, "https://router.requesty.ai/v1"),
+            (ProviderKind::Opper, "https://api.opper.ai/v3/compat"),
             (
                 ProviderKind::Kimi,
                 crate::auth::kimi_device::KIMI_CODE_BASE_URL,
@@ -2423,6 +2434,70 @@ mod tests {
 
         assert!(
             message.contains("REQUESTY_API_KEY"),
+            "unexpected error: {message}"
+        );
+        assert!(!message.contains("test-openai-key-must-not-leak"));
+    }
+
+    fn parsed_opper_kind() -> ProviderKind {
+        crate::provider::parse_provider("opper")
+            .expect("opper should resolve through the production parser")
+    }
+
+    #[test]
+    fn opper_default_base_url_is_v3_compat() {
+        let got = resolve_provider_base_url(parsed_opper_kind(), None, no_env)
+            .expect("Opper default URL should resolve");
+
+        assert_eq!(got.as_deref(), Some("https://api.opper.ai/v3/compat"));
+    }
+
+    #[test]
+    fn opper_configured_https_base_url_overrides_default() {
+        let got = resolve_provider_base_url(
+            parsed_opper_kind(),
+            Some("https://opper.example.com/v3/compat".to_string()),
+            no_env,
+        )
+        .expect("configured Opper URL should resolve");
+
+        assert_eq!(got.as_deref(), Some("https://opper.example.com/v3/compat"));
+    }
+
+    #[test]
+    fn opper_client_builds_from_only_opper_api_key() {
+        let client = create_client_with(
+            "opper",
+            None,
+            &HashMap::new(),
+            |name| (name == "OPPER_API_KEY").then(|| "test-opper-key".to_string()),
+            || Ok(None),
+        )
+        .expect("Opper client should build from its standard environment key");
+        let model = client.completion_model("claude-sonnet-4-6");
+
+        assert_eq!(
+            (model.provider_name(), model.name()),
+            ("opper", "claude-sonnet-4-6".to_string()),
+        );
+    }
+
+    #[test]
+    fn opper_missing_key_names_only_opper_api_key() {
+        let result = create_client_with(
+            "opper",
+            None,
+            &HashMap::new(),
+            |name| (name == "OPENAI_API_KEY").then(|| "test-openai-key-must-not-leak".to_string()),
+            || Ok(None),
+        );
+        let message = match result {
+            Ok(_) => panic!("Opper must not accept an OpenAI key"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            message.contains("OPPER_API_KEY"),
             "unexpected error: {message}"
         );
         assert!(!message.contains("test-openai-key-must-not-leak"));

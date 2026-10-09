@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Opper as a built-in provider. Set `OPPER_API_KEY` and select it with
+  `--provider opper` (or a `providers.opper` entry); defaults to
+  `claude-sonnet-4-6` against `https://api.opper.ai/v3/compat`. Reasoning
+  effort goes out as a top-level `reasoning_effort` clamped to
+  `low`/`medium`/`high`. It is not part of key autodetection.
+
 ## [0.25.7] - 2026-09-27
 
 ### Added

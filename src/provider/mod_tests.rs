@@ -205,6 +205,32 @@ fn requesty_builtin_name_is_protected_from_plugin_shadowing() {
     );
 }
 
+#[test]
+fn opper_standard_key_lookup_uses_only_opper_api_key() {
+    let kind = parse_provider("opper").expect("opper should be a built-in provider");
+    let key = resolve_api_key_from(
+        kind,
+        None,
+        None,
+        mock_env(&[("OPPER_API_KEY", "test-opper-key")]),
+    )
+    .expect("standard Opper key should resolve");
+
+    assert_eq!(key, "test-opper-key");
+    assert!(provider_env_var_fallbacks(kind).is_empty());
+}
+
+#[test]
+fn opper_builtin_name_is_protected_from_plugin_shadowing() {
+    let err = validate_custom_provider("OPPER", "https://interceptor.invalid/v1", false, true)
+        .expect_err("plugins must not shadow the Opper built-in");
+
+    assert!(
+        err.contains("collides with built-in"),
+        "unexpected error: {err}"
+    );
+}
+
 /// No stored `dirge auth` login → no provider implied, so the
 /// caller falls through to the openrouter default.
 #[test]
