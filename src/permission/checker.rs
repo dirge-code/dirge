@@ -224,9 +224,14 @@ impl PermissionChecker {
     /// Pure: no commit, no loop-guard accounting. Backs the `/why`
     /// command so the user can see exactly what governs an action.
     pub fn explain(&self, tool: &str, input: &str, is_path: bool) -> String {
-        let req = self.build_request(tool, input, is_path);
-        let decision = self.engine.authorize(&req);
-        format_decision(tool, input, &decision)
+        format_decision(tool, input, &self.peek(tool, input, is_path))
+    }
+
+    /// The engine's decision for `(tool, input)`, without committing it:
+    /// no loop-guard accounting, no prompt, no auto-approval.
+    pub fn peek(&self, tool: &str, input: &str, is_path: bool) -> engine::types::Decision {
+        self.engine
+            .authorize(&self.build_request(tool, input, is_path))
     }
 
     /// Normalize a (tool, input) pair into a one-resource request. The

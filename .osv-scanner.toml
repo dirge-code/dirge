@@ -7,6 +7,14 @@ id = "RUSTSEC-2024-0384"
 reason = "instant is a transitive dep of notify-types → notify (dirge's watch dep); unmaintained, no drop-in fork yet — notify maintainers are tracking web-time migration"
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2023-0089"
+reason = "atomic-polyfill (unmaintained, no vulnerability) is a transitive dep of cljrs-ir via postcard -> heapless 0.7; only in builds with the addons feature"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2020-0168"
+reason = "mach (unmaintained, no vulnerability) is a transitive dep of cljrs-gc via system-memory; only in builds with the addons feature"
+
+[[IgnoredVulns]]
 id = "RUSTSEC-2026-0370"
 reason = "zvariant was merged into zbus 6.0.0 as its `wire` module; dirge reaches it transitively via notify-rust 4.18 → zbus 5.18, and notify-rust still pins zbus 5, so there is no upgrade path yet"
 

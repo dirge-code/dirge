@@ -1,3 +1,4 @@
+pub(crate) mod addon_phase;
 mod agent_io;
 pub(crate) mod ansi;
 pub(crate) mod avatar;
@@ -704,6 +705,38 @@ pub async fn run_interactive(
                 ui.is_running = false;
             }
         };
+    }
+
+    // Start a streamed turn on a prompt a slash command or an addon job
+    // handed back: record it, spawn the runner and install it.
+    macro_rules! start_prompt_turn {
+        ($prompt:expr) => {{
+            let run_text: String = $prompt;
+            ui.last_user_prompt = run_text.clone();
+            let history = crate::agent::runner::convert_history(session);
+            session.add_message(MessageRole::User, &run_text);
+            let runner = agent.clone().spawn_runner(
+                crate::provider::Prompt::text(
+                    crate::agent::tools::background::prepend_pending_notifications(
+                        &run_text,
+                        bg_store.as_ref(),
+                    ),
+                ),
+                history,
+                Some(ui.interjection_queue.clone()),
+                Some(session.assets_dir()),
+            );
+            runner.install_into(
+                &mut ui.agent_rx,
+                &mut ui.agent_abort,
+                &mut ui.agent_interject,
+                &mut ui.agent_cancel,
+                &mut ui.is_running,
+            );
+            begin_snapshot_turn(session);
+            // dirge-vpma.18: a run is active, so not the resting face.
+            renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
+        }};
     }
 
     // #387: the render effect. Builds the StatusLine ONCE from the model
@@ -2139,6 +2172,11 @@ pub async fn run_interactive(
                                         if let Some(ph) = ui.wt_merge_phase.take() {
                                             ph.core.task.abort();
                                         }
+                                        // And stop waiting on an addon command or
+                                        // `/addons reload`.
+                                        if let Some(ph) = ui.addon_phase.take() {
+                                            ph.core.task.abort();
+                                        }
                                         // dirge-vpma.21: and a `!`/`!!` shell run.
                                         //
                                         // Once the shell box is mounted, keys route to
@@ -2287,6 +2325,10 @@ pub async fn run_interactive(
                                     }
                                     // dirge-iagk: and an in-flight `/wt-merge`.
                                     if let Some(ph) = ui.wt_merge_phase.take() {
+                                        ph.core.task.abort();
+                                    }
+                                    // And an addon command or `/addons reload`.
+                                    if let Some(ph) = ui.addon_phase.take() {
                                         ph.core.task.abort();
                                     }
                                     if let Some(tx) = ui.agent_cancel.take() {
@@ -3199,23 +3241,21 @@ pub async fn run_interactive(
                                                 // slots (agent_rx/is_running/select!), so we
                                                 // launch the streamed turn here — the same
                                                 // control-flow channel as DEFER_COMPRESS.
-                                                let run_text = prompt;
-        if !run_text.is_empty() {
-                                                    ui.last_user_prompt = run_text.clone();
-                                                    let history =
-                                                        crate::agent::runner::convert_history(session);
-                                                    session.add_message(MessageRole::User, &run_text);
-                                                    let runner = agent.clone().spawn_runner(
-                                                        crate::provider::Prompt::text(crate::agent::tools::background::prepend_pending_notifications(&run_text, bg_store.as_ref())),
-                                                        history,
-                                                        Some(ui.interjection_queue.clone()),
-                                                        Some(session.assets_dir()),
-                                                    );
-                                                    runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
-                                                    begin_snapshot_turn(session);
-                                                    // dirge-vpma.18: a run is active — do not paint the resting face.
-                                                    renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
+        if !prompt.is_empty() {
+                                                    start_prompt_turn!(prompt);
                                                 }
+                                            }
+                                            #[cfg(feature = "addons")]
+                                            Ok(SlashOutcome::DeferAddon(job)) => {
+                                                // The job runs on a blocking thread; the
+                                                // `addon_phase` arm lands its result. The loop
+                                                // stays live meanwhile, so a permission prompt
+                                                // the job raises can be answered, and Ctrl+C
+                                                // stops waiting for it. `is_running` makes the
+                                                // busy gate refuse a second job meanwhile.
+                                                ui.addon_phase = Some(crate::ui::addon_phase::spawn(job));
+                                                ui.is_running = true;
+                                                renderer.set_avatar_state(avatar::AvatarState::Thinking);
                                             }
                                             Err(e) => {
                                                 if e.downcast_ref::<std::io::Error>().is_some_and(|e: &std::io::Error| e.kind() == std::io::ErrorKind::Interrupted) {
@@ -4607,6 +4647,54 @@ pub async fn run_interactive(
                         renderer.set_avatar_state(avatar::AvatarState::Idle);
                         renderer.request_repaint();
                     }
+                    // An addon command or `/addons reload` finished on its blocking
+                    // thread: show its lines, apply a reload's tools to the live agent,
+                    // then start the turn a command asked for or drain what was typed
+                    // meanwhile. Arm is unconditional (select! rejects `#[cfg]` arms);
+                    // the field is always `None` without the `addons` feature.
+                    addon_done = async {
+                        if let Some(ph) = &mut ui.addon_phase {
+                            ph.core.rx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        let _ = ui.addon_phase.take();
+                        #[cfg(feature = "addons")]
+                        {
+                            let landing = crate::ui::addon_phase::land(
+                                addon_done, &mut agent, &permission, &ask_tx,
+                            );
+                            for line in &landing.lines {
+                                renderer.write_line(&line.text, line.tone.color())?;
+                            }
+                            match landing.prompt {
+                                Some(prompt) if !prompt.is_empty() => start_prompt_turn!(prompt),
+                                _ => drain_interjections!(),
+                            }
+                        }
+                        #[cfg(not(feature = "addons"))]
+                        let _ = addon_done;
+                        renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
+                        renderer.request_repaint();
+                    }
+                    // The addons changed in place (a REPL evaluation or
+                    // `dirge.harness/refresh!`): the live agent takes their tools as
+                    // they are now. Unconditional arm; never ready without `addons`.
+                    _ = crate::ui::addon_phase::live_change() => {
+                        #[cfg(feature = "addons")]
+                        {
+                            let landing = crate::ui::addon_phase::land_live(
+                                &mut agent, &permission, &ask_tx,
+                            );
+                            for line in &landing.lines {
+                                renderer.write_line(&line.text, line.tone.color())?;
+                            }
+                            if !landing.lines.is_empty() {
+                                renderer.request_repaint();
+                            }
+                        }
+                    }
                     Some(ask_req) = async {
                         if let Some(rx) = &mut ask_rx {
                             rx.recv().await
@@ -4907,12 +4995,13 @@ pub async fn run_interactive(
                             agent.extend_loop_tools(tools);
                             // #701: re-publish the live agent so `current_agent()`
                             // (what a tooled `task(agent=…)` subagent forks off)
-                            // reflects the just-injected MCP tools + their names.
+                            // and the `call-tool` registry (plugins and addons)
+                            // reflect the just-injected MCP tools + their names.
                             // Without this the background-loaded MCP tools reach
                             // the main loop (via `agent.clone()` per prompt) but
-                            // NOT subagents, whose snapshot would stay pre-MCP
-                            // until the next rebuild (/model, /agent, /cd, …).
-                            crate::provider::set_current_agent(std::sync::Arc::new(agent.clone()));
+                            // NOT subagents or `call-tool`, whose snapshots would
+                            // stay pre-MCP until the next rebuild (/model, /cd, …).
+                            crate::provider::publish_live_agent(&agent);
                             mcp_manager = Some(mgr);
                             mcp_ready_rx = None;
                             tracing::info!("MCP ready: injected {n} tool(s) into the live agent");
@@ -5434,6 +5523,9 @@ pub async fn run_interactive(
     // background loader), so we close its child processes on the way out
     // rather than relying on drop. `None` when MCP never finished
     // connecting (or there were no servers) — nothing to do.
+    // The session ends first, while its addon listeners can still reach MCP.
+    #[cfg(feature = "addons")]
+    crate::agent::session_lifecycle::end(crate::agent::session_lifecycle::EndCause::Quit).await;
     #[cfg(feature = "mcp")]
     if let Some(mgr) = mcp_manager.take() {
         mgr.shutdown().await;

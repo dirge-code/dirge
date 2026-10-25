@@ -178,6 +178,53 @@ pub type GetFollowupMessagesFn =
 /// re-woken when the batch becomes deliverable.
 pub type ShouldDeferFinalizationFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// What a run opens with: its system prompt, the prompt that starts it, and
+/// the reminders its first user turn leads with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunOpening {
+    pub system_prompt: String,
+    pub prompt: String,
+    pub reminders: Vec<String>,
+    /// Why the run must not start, such as a prompt a hook blocked. The run
+    /// then ends with it as its error, without calling the model.
+    pub refusal: Option<String>,
+}
+
+impl RunOpening {
+    /// The text of the first user turn: the reminders, then the prompt.
+    pub fn first_turn_text(&self) -> String {
+        if self.reminders.is_empty() {
+            self.prompt.clone()
+        } else {
+            format!("{}\n\n{}", self.reminders.join("\n"), self.prompt)
+        }
+    }
+}
+
+/// Amends a run's opening before its first model call. Runs inside the
+/// run's task, on the agent runtime.
+pub type OpenRunFn =
+    Arc<dyn Fn(RunOpening) -> Pin<Box<dyn Future<Output = RunOpening> + Send>> + Send + Sync>;
+
+/// `first`, then `second` on what `first` answered. A refusal from `first`
+/// ends the opening: `second` does not run.
+pub fn compose_open_run(first: Option<OpenRunFn>, second: Option<OpenRunFn>) -> Option<OpenRunFn> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(Arc::new(move |opening: RunOpening| {
+            let (first, second) = (first.clone(), second.clone());
+            Box::pin(async move {
+                let opened = first(opening).await;
+                if opened.refusal.is_some() {
+                    opened
+                } else {
+                    second(opened).await
+                }
+            })
+        })),
+        (first, second) => first.or(second),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +238,48 @@ mod tests {
         let r = BeforeToolCallReturn::default();
         assert!(r.result.is_none());
         assert_eq!(r.args, Value::Null);
+    }
+
+    fn appending(text: &'static str) -> OpenRunFn {
+        Arc::new(move |mut opening: RunOpening| {
+            Box::pin(async move {
+                opening.system_prompt.push_str(text);
+                opening
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn open_run_steps_run_in_order() {
+        assert!(compose_open_run(None, None).is_none());
+        let both = compose_open_run(Some(appending("a")), Some(appending("b"))).unwrap();
+        assert_eq!(both(RunOpening::default()).await.system_prompt, "ab");
+        let second = compose_open_run(None, Some(appending("b"))).unwrap();
+        assert_eq!(second(RunOpening::default()).await.system_prompt, "b");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_ends_the_opening() {
+        let refusing: OpenRunFn = Arc::new(|mut opening: RunOpening| {
+            Box::pin(async move {
+                opening.refusal = Some("no".into());
+                opening
+            })
+        });
+        let both = compose_open_run(Some(refusing), Some(appending("b"))).unwrap();
+        let opened = both(RunOpening::default()).await;
+        assert_eq!(opened.refusal.as_deref(), Some("no"));
+        assert_eq!(opened.system_prompt, "");
+    }
+
+    #[test]
+    fn the_first_turn_leads_with_its_reminders() {
+        let mut opening = RunOpening {
+            prompt: "do it".into(),
+            ..RunOpening::default()
+        };
+        assert_eq!(opening.first_turn_text(), "do it");
+        opening.reminders = vec!["<r1>".into(), "<r2>".into()];
+        assert_eq!(opening.first_turn_text(), "<r1>\n<r2>\n\ndo it");
     }
 }

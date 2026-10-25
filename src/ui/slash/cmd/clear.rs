@@ -5,6 +5,8 @@ use crate::ui::slash::SlashCtx;
 
 pub(crate) async fn cmd_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     crate::agent::review::maybe_fire_session_end(ctx.agent, ctx.session);
+    #[cfg(feature = "addons")]
+    crate::agent::session_lifecycle::end(crate::agent::session_lifecycle::EndCause::Clear).await;
     ctx.session.messages.clear();
     ctx.session.total_estimated_tokens = 0;
     ctx.session.compactions.clear();

@@ -89,5 +89,20 @@ pub(crate) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         }
     }
 
+    #[cfg(feature = "addons")]
+    if let Some(host) = crate::addons::global() {
+        let cmds = host.commands();
+        if !cmds.is_empty() {
+            renderer.write_line("", c_agent())?;
+            renderer.write_line("addon commands:", c_agent())?;
+            for c in cmds {
+                renderer.write_line(
+                    &format!("  /{:<20} {} [{}]", c.name, c.description, c.addon_id),
+                    c_result(),
+                )?;
+            }
+        }
+    }
+
     Ok(())
 }

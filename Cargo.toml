@@ -165,6 +165,23 @@ semantic-dafny = ["semantic", "dep:tree-sitter-dafny"]
 semantic-swift = ["semantic", "dep:tree-sitter-swift"]
 semantic-mojo = ["semantic", "dep:tree-sitter-language", "dep:cc"]
 plugin = ["dep:janetrs"]
+# Clojure addon host: runs addons written in Clojure (.cljc/.cljrs) on an
+# embedded clojurust interpreter. Opt-in and not part of `default`,
+# `no-plugin` or `windows-default`. The clojurust crates are taken with
+# default features off: their defaults include `deps` (gitoxide + rPGP +
+# ssh-key, ~290 crates) and Cargo unions features across every edge, so a
+# single default-on edge would pull that tree back in. Each edge selects
+# `regex-full` explicitly instead.
+addons = [
+    "dep:cljrs-runtime",
+    "dep:cljrs-stdlib",
+    "dep:cljrs-interop",
+    "dep:cljrs-value",
+    "dep:cljrs-reader",
+    "dep:cljrs-gc",
+]
+# Embedded nREPL server for live addon development (implies `addons`).
+addons-nrepl = ["addons", "dep:cljrs-nrepl"]
 lsp = ["dep:lsp-types"]
 dap = ["dep:which", "dep:dap"]
 sandbox-microvm = ["dep:libkrun-sys", "dep:russh", "dep:hex"]
@@ -356,6 +373,16 @@ tree-sitter-c = { version = "0.24", optional = true }
 tree-sitter-cpp = { version = "0.23", optional = true }
 streaming-iterator = { version = "0.1", optional = true }
 janetrs = { version = "0.8", optional = true }
+# Clojure addon host (`addons` feature). Every crate is pinned to one
+# clojurust revision and taken with default-features = false (see the
+# `addons` feature for why).
+cljrs-runtime = { git = "https://github.com/BuddhiLW/clojurust", rev = "7498e85003a36c4f0e168a5642b4e82a4d8443a4", default-features = false, features = ["regex-full"], optional = true }
+cljrs-stdlib = { git = "https://github.com/BuddhiLW/clojurust", rev = "7498e85003a36c4f0e168a5642b4e82a4d8443a4", default-features = false, features = ["regex-full"], optional = true }
+cljrs-interop = { git = "https://github.com/BuddhiLW/clojurust", rev = "7498e85003a36c4f0e168a5642b4e82a4d8443a4", default-features = false, features = ["regex-full"], optional = true }
+cljrs-value = { git = "https://github.com/BuddhiLW/clojurust", rev = "7498e85003a36c4f0e168a5642b4e82a4d8443a4", default-features = false, features = ["regex-full"], optional = true }
+cljrs-reader = { git = "https://github.com/BuddhiLW/clojurust", rev = "7498e85003a36c4f0e168a5642b4e82a4d8443a4", default-features = false, optional = true }
+cljrs-gc = { git = "https://github.com/BuddhiLW/clojurust", rev = "7498e85003a36c4f0e168a5642b4e82a4d8443a4", default-features = false, optional = true }
+cljrs-nrepl = { git = "https://github.com/BuddhiLW/clojurust", rev = "7498e85003a36c4f0e168a5642b4e82a4d8443a4", default-features = false, features = ["regex-full"], optional = true }
 html2text = "0.17"
 indexmap = "2"
 # Windows-safe canonicalize: returns non-verbatim paths (no `\\?\` prefix)

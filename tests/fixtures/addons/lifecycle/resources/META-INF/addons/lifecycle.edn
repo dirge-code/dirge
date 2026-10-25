@@ -1,0 +1,3 @@
+{:addon/id      "lifecycle"
+ :addon/init-ns "lifecycle.addon"
+ :addon/init-fn "addon-ctor"}
