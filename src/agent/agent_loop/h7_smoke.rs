@@ -339,6 +339,8 @@ async fn h7_scenario_1_simple_text() {
         bg_store: None,
         memory_provider: None,
         command_hooks: None,
+        addon_hooks: None,
+        open_run: None,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
@@ -443,6 +445,8 @@ async fn h7_scenario_2_turn_boundaries() {
         bg_store: None,
         memory_provider: None,
         command_hooks: None,
+        addon_hooks: None,
+        open_run: None,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
@@ -581,6 +585,8 @@ async fn h7_scenario_5_auth_error_surfaces() {
         bg_store: None,
         memory_provider: None,
         command_hooks: None,
+        addon_hooks: None,
+        open_run: None,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, _) = drain_to_done(runner).await;
@@ -772,6 +778,8 @@ async fn h7_scenario_3_tool_dispatch() {
         bg_store: None,
         memory_provider: None,
         command_hooks: None,
+        addon_hooks: None,
+        open_run: None,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
@@ -924,6 +932,8 @@ async fn h7_glm_scenario_1_simple_text() {
         bg_store: None,
         memory_provider: None,
         command_hooks: None,
+        addon_hooks: None,
+        open_run: None,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
@@ -1084,6 +1094,8 @@ async fn h7_glm_scenario_3_tool_dispatch() {
         bg_store: None,
         memory_provider: None,
         command_hooks: None,
+        addon_hooks: None,
+        open_run: None,
     };
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
@@ -1196,6 +1208,8 @@ fn cerebras_spawn_config(
         bg_store: None,
         memory_provider: None,
         command_hooks: None,
+        addon_hooks: None,
+        open_run: None,
     }
 }
 

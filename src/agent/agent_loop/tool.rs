@@ -161,6 +161,14 @@ pub trait LoopTool: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Who contributes the tool at runtime (`"addon"` for Clojure addon
+    /// tools), so that source can replace or drop exactly its own tools in a
+    /// live agent. `None`, the default, for tools fixed at build time.
+    #[cfg_attr(not(feature = "addons"), allow(dead_code))]
+    fn source(&self) -> Option<&str> {
+        None
+    }
+
     /// Per-dispatch budget for the watchdog in
     /// `execute_prepared_tool_call` (dirge-9tl3). `None` — the default —
     /// means "use the shared `timeouts.tool_call` ceiling". Override ONLY

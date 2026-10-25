@@ -1,0 +1,3 @@
+{:addon/id      "flat"
+ :addon/init-ns "flat.addon"
+ :addon/init-fn "addon-ctor"}

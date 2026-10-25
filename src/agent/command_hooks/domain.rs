@@ -61,7 +61,9 @@ impl fmt::Display for HookEvent {
     }
 }
 
-/// One `{ "type": "command", "command": ..., "timeout": ... }` entry.
+/// One `{ "type": "command", "command": ..., "timeout": ... }` entry, or
+/// `{ "type": "addon", "addon": ..., "handler": ..., "timeout": ... }`,
+/// answered by a handler an addon registered instead of a process.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct HookCommand {
     #[serde(rename = "type", default = "default_kind")]
@@ -71,6 +73,12 @@ pub struct HookCommand {
     /// Seconds.
     #[serde(default)]
     pub timeout: Option<u64>,
+    /// `type: "addon"`: the id of the addon that answers.
+    #[serde(default)]
+    pub addon: Option<String>,
+    /// `type: "addon"`: the handler name within that addon.
+    #[serde(default)]
+    pub handler: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -78,9 +86,40 @@ fn default_kind() -> String {
 }
 
 impl HookCommand {
-    /// Only `type: "command"` entries with a non-blank command run.
+    /// `type: "command"` entries with a non-blank command run, and
+    /// `type: "addon"` entries naming both an addon and a handler.
     pub fn is_runnable(&self) -> bool {
-        self.kind == "command" && !self.command.trim().is_empty()
+        match self.kind.as_str() {
+            "command" => !self.command.trim().is_empty(),
+            "addon" => self.addon_target().is_some(),
+            _ => false,
+        }
+    }
+
+    /// `(addon, handler)` of an addon entry, both non-blank.
+    pub fn addon_target(&self) -> Option<(&str, &str)> {
+        if self.kind != "addon" {
+            return None;
+        }
+        let addon = self
+            .addon
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let handler = self
+            .handler
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        Some((addon, handler))
+    }
+
+    /// What names this entry in a log line: its command, or `addon:<id>/<handler>`.
+    pub fn label(&self) -> String {
+        match self.addon_target() {
+            Some((addon, handler)) => format!("addon:{addon}/{handler}"),
+            None => self.command.clone(),
+        }
     }
 
     pub fn timeout_secs(&self) -> u64 {
@@ -131,13 +170,17 @@ impl fmt::Display for HookError {
 }
 
 /// The folded answer of every command that ran for one event. Combines
-/// as a monoid: the first block wins, contexts concatenate, the last
-/// input rewrite wins.
+/// as a monoid: the first block wins, then the first ask, contexts
+/// concatenate, the last input rewrite wins.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HookOutcome {
     /// Blocking reason (exit 2, `permissionDecision: "deny"`, or
     /// `decision: "block"`).
     pub block: Option<String>,
+    /// `permissionDecision: "ask"`: the action waits for the user to
+    /// confirm it, with this reason shown at the prompt. A block
+    /// outranks it.
+    pub ask: Option<String>,
     /// `additionalContext` strings, plus plain stdout for the events whose
     /// stdout is context.
     pub context: Vec<String>,
@@ -153,6 +196,13 @@ impl HookOutcome {
         }
     }
 
+    pub fn asked(reason: impl Into<String>) -> Self {
+        Self {
+            ask: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
     pub fn with_context(text: impl Into<String>) -> Self {
         Self {
             context: vec![text.into()],
@@ -164,11 +214,22 @@ impl HookOutcome {
         if self.block.is_none() {
             self.block = other.block;
         }
+        if self.ask.is_none() {
+            self.ask = other.ask;
+        }
         self.context.extend(other.context);
         if other.updated_input.is_some() {
             self.updated_input = other.updated_input;
         }
         self
+    }
+
+    /// The ask still pending: `None` once a block decides the action.
+    pub fn pending_ask(&self) -> Option<&str> {
+        match self.block {
+            Some(_) => None,
+            None => self.ask.as_deref(),
+        }
     }
 
     /// Context joined into one block, `None` when there is none.
@@ -182,6 +243,16 @@ impl HookOutcome {
             .join("\n\n");
         (!joined.is_empty()).then_some(joined)
     }
+}
+
+/// What `UserPromptSubmit` made of a prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submission {
+    /// Send this text to the model: the prompt, with any hook context
+    /// prepended.
+    Proceed(String),
+    /// Do not call the model. Carries the message shown to the user.
+    Blocked(String),
 }
 
 /// Wraps hook context for injection into a model-visible message.

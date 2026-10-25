@@ -35,6 +35,41 @@ Two sources, concatenated per event:
 A command runs as `sh -c <command>` (so `~` expands) with `CLAUDE_PROJECT_DIR`,
 `DIRGE_PROJECT_DIR` and `DIRGE_HOOK=1` set. `timeout` is in seconds (default 60).
 
+### Addon entries
+
+With the `addons` feature, an entry can name a handler an [addon](addons.md)
+registered instead of a command. No process starts; the addon answers
+in-process:
+
+```json
+{ "type": "addon", "addon": "hive.dirge", "handler": "guard", "timeout": 10 }
+```
+
+The addon registers the handler under `:dirge/command-hooks` in its `hooks`
+map, keyed by name, as a fn of `{:payload <the event's JSON payload>}`:
+
+```clojure
+{:dirge/command-hooks {"guard" (fn [{:keys [payload]}] ...)}}
+```
+
+Its answer is read as the process it stands in for, then decoded exactly as a
+command's output (see [Answering](#answering)):
+
+- a map with an integer `exit` (and optional `stdout`, `stderr` strings) is that
+  exit, verbatim;
+- `nil` is exit 0 with nothing on stdout;
+- a string is exit 0 with that string on stdout;
+- anything else, typically a Claude-style JSON answer, is exit 0 with its JSON
+  on stdout.
+
+An addon entry fails open like a command: no addon host running, an addon or
+handler that is not loaded, a handler that throws, or no answer within
+`timeout` all allow the action and are logged. `SessionStart`,
+`UserPromptSubmit` and `SubagentStart` run on dirge's event loop, where the
+addon isolate answers within 5 seconds and refuses anything that waits on the
+loop, such as an MCP call; a handler that needs one allows those moments
+unjudged. The tool events and `Stop` run off the loop and can wait.
+
 ## Events
 
 | Event | Fires | Matcher is matched against | Effect |
@@ -42,7 +77,7 @@ A command runs as `sh -c <command>` (so `~` expands) with `CLAUDE_PROJECT_DIR`,
 | `PreToolUse` | before every tool call (main agent and subagents) | Claude tool name, and dirge's | block refuses the call; context rides on the result; `updatedInput` rewrites the args |
 | `PostToolUse` | after every tool call | Claude tool name, and dirge's | block reason and context are appended to the result |
 | `SessionStart` | first run of a session (`source`: `startup` / `resume`) | `source` | context is appended to the system prompt |
-| `UserPromptSubmit` | each user prompt | (all groups) | context is prepended to the prompt; a block replaces the prompt with a refusal notice |
+| `UserPromptSubmit` | each user prompt | (all groups) | context is prepended to the prompt; a block ends the run with the hook's reason and the model is not called |
 | `SubagentStart` | a `task` subagent is forked (`agent_type`: `task`) | `agent_type` | context is appended to the child's system prompt |
 | `Stop` / `SubagentStop` | the main agent / a subagent is about to finish | (all groups) | a block feeds its reason back and the agent continues (`stop_hook_active` is set on the next check; at most 8 in a row) |
 

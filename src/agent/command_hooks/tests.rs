@@ -5,12 +5,13 @@ use serde_json::{Value, json};
 
 use super::boundary::{HookRunner, ShellRunner};
 use super::domain::{
-    Exited, HookCommand, HookError, HookEvent, HookMatcher, HookOutcome, HooksConfig,
+    Exited, HookCommand, HookError, HookEvent, HookMatcher, HookOutcome, HooksConfig, Submission,
 };
 use super::loop_hooks;
 use super::{CommandHooks, HookBinding, dialect, policy};
-use crate::agent::agent_loop::hooks::BeforeToolCallContext;
+use crate::agent::agent_loop::hooks::{BeforeToolCallContext, BeforeToolCallFn};
 use crate::agent::agent_loop::message::{AssistantMessage, StopReason};
+use crate::permission::ask::UserDecision;
 
 // ---------------------------------------------------------------- stubs
 
@@ -65,6 +66,8 @@ fn cmd(command: &str) -> HookCommand {
         kind: "command".into(),
         command: command.into(),
         timeout: Some(5),
+        addon: None,
+        handler: None,
     }
 }
 
@@ -222,9 +225,168 @@ fn normalize_drops_non_command_and_blank_entries() {
                 kind: "prompt".into(),
                 command: "x".into(),
                 timeout: None,
+                addon: None,
+                handler: None,
             }],
         });
     assert!(policy::normalize(cfg).is_empty());
+}
+
+// ------------------------------------------------------- addon entries
+
+fn addon_cmd(addon: &str, handler: &str) -> HookCommand {
+    HookCommand {
+        kind: "addon".into(),
+        command: String::new(),
+        timeout: Some(5),
+        addon: Some(addon.into()),
+        handler: Some(handler.into()),
+    }
+}
+
+fn one_entry(event: HookEvent, hook: HookCommand) -> HooksConfig {
+    let mut cfg = HooksConfig::new();
+    cfg.insert(
+        event.as_str().to_string(),
+        vec![HookMatcher {
+            matcher: None,
+            hooks: vec![hook],
+        }],
+    );
+    cfg
+}
+
+#[test]
+fn addon_entries_parse_and_survive_normalize() {
+    let text = r#"{"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "addon", "addon": "hive.dirge", "handler": "guard", "timeout": 10},
+        {"type": "addon", "addon": "hive.dirge"},
+        {"type": "addon", "addon": " ", "handler": "guard"}
+    ]}]}}"#;
+    let cfg = policy::normalize(policy::parse_settings_hooks("t", text).unwrap());
+    let hooks = &cfg["PreToolUse"][0].hooks;
+    assert_eq!(
+        hooks.len(),
+        1,
+        "an addon entry needs both addon and handler"
+    );
+    assert_eq!(hooks[0].addon_target(), Some(("hive.dirge", "guard")));
+    assert_eq!(hooks[0].timeout_secs(), 10);
+    assert_eq!(hooks[0].label(), "addon:hive.dirge/guard");
+}
+
+#[test]
+fn addon_answers_read_as_the_process_they_stand_in_for() {
+    let answer = json!({"hookSpecificOutput": {"permissionDecision": "deny"}});
+    assert_eq!(
+        policy::addon_answer(&answer),
+        exit(0, &answer.to_string(), "")
+    );
+    assert_eq!(
+        policy::addon_answer(&json!({"exit": 2, "stderr": "no"})),
+        exit(2, "", "no")
+    );
+    assert_eq!(policy::addon_answer(&Value::Null), exit(0, "", ""));
+    assert_eq!(policy::addon_answer(&json!("ctx")), exit(0, "ctx", ""));
+    assert_eq!(policy::addon_answer(&json!({})), exit(0, "{}", ""));
+}
+
+/// Stands in for the live addon runner: the handler's value, read by
+/// `policy::addon_answer`, or an error as the live runner reports it.
+struct ScriptedAddon(Result<Value, HookError>);
+
+impl HookRunner for ScriptedAddon {
+    fn run(&self, cmd: &HookCommand, _: &str, _: &Path) -> Result<Exited, HookError> {
+        assert!(cmd.addon_target().is_some());
+        self.0.clone().map(|v| policy::addon_answer(&v))
+    }
+}
+
+fn dispatch(addon: Option<Arc<dyn HookRunner>>) -> Arc<dyn HookRunner> {
+    Arc::new(super::boundary::DispatchRunner::new(
+        Arc::new(ShellRunner),
+        Arc::new(move || addon.clone()),
+    ))
+}
+
+#[test]
+fn an_addon_entry_without_an_addon_runner_fails_open() {
+    let hooks = registry(
+        one_entry(HookEvent::PreToolUse, addon_cmd("hive.dirge", "guard")),
+        dispatch(None),
+    );
+    let out = hooks.run(HookEvent::PreToolUse, &["Bash"], &json!({}));
+    assert_eq!(out, HookOutcome::default());
+}
+
+#[test]
+fn dispatch_sends_command_entries_to_the_shell() {
+    let hooks = registry(
+        one_entry(HookEvent::PreToolUse, cmd("echo nope >&2; exit 2")),
+        dispatch(Some(Arc::new(ScriptedAddon(Ok(Value::Null))))),
+    );
+    let out = hooks.run(HookEvent::PreToolUse, &["Bash"], &json!({}));
+    assert_eq!(out, HookOutcome::blocked("nope"));
+}
+
+/// The same answer through `sh` and through an addon lands on the same
+/// outcome: one decoder, `policy::interpret`, reads both.
+#[test]
+fn addon_and_shell_runners_agree_on_every_answer() {
+    let deny = deny_json("rule R1");
+    let warn = warn_json("careful");
+    let stop = json!({"decision": "block", "reason": "not yet"}).to_string();
+    let cases: Vec<(HookEvent, String, Result<Value, HookError>)> = vec![
+        (
+            HookEvent::PreToolUse,
+            format!("printf '%s' '{deny}'"),
+            Ok(serde_json::from_str(&deny).unwrap()),
+        ),
+        (
+            HookEvent::PreToolUse,
+            format!("printf '%s' '{warn}'"),
+            Ok(serde_json::from_str(&warn).unwrap()),
+        ),
+        (
+            HookEvent::Stop,
+            format!("printf '%s' '{stop}'"),
+            Ok(serde_json::from_str(&stop).unwrap()),
+        ),
+        (HookEvent::PreToolUse, "printf '{}'".into(), Ok(json!({}))),
+        (HookEvent::PreToolUse, "true".into(), Ok(Value::Null)),
+        (
+            HookEvent::PreToolUse,
+            "echo blocked >&2; exit 2".into(),
+            Ok(json!({"exit": 2, "stderr": "blocked\n"})),
+        ),
+        (
+            HookEvent::PreToolUse,
+            "echo broken >&2; exit 3".into(),
+            Ok(json!({"exit": 3, "stderr": "broken\n"})),
+        ),
+        (
+            HookEvent::SessionStart,
+            "printf 'plain context'".into(),
+            Ok(json!("plain context")),
+        ),
+        (
+            HookEvent::PreToolUse,
+            "sleep 5".into(),
+            Err(HookError::TimedOut(1)),
+        ),
+    ];
+    for (event, shell, addon) in cases {
+        let mut shell_cmd = cmd(&shell);
+        shell_cmd.timeout = Some(1);
+        let via_shell =
+            registry(one_entry(event, shell_cmd), dispatch(None)).run(event, &["Bash"], &json!({}));
+        let via_addon = registry(
+            one_entry(event, addon_cmd("hive.dirge", "guard")),
+            dispatch(Some(Arc::new(ScriptedAddon(addon)))),
+        )
+        .run(event, &["Bash"], &json!({}));
+        assert_eq!(via_addon, via_shell, "{event} `{shell}`");
+    }
 }
 
 #[test]
@@ -417,6 +579,92 @@ async fn pre_tool_hook_warning_rides_as_context() {
     assert!(ret.context[0].contains("prefer rg"));
 }
 
+fn ask_json(reason: &str) -> String {
+    json!({ "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason,
+    }})
+    .to_string()
+}
+
+type SeenAsk = (String, String, Option<String>);
+
+/// A permission prompt that gives every ask the same answer, recording
+/// the tool, input and reason it was shown.
+fn prompt_answering(
+    decision: UserDecision,
+) -> (crate::permission::ask::AskSender, Arc<Mutex<Vec<SeenAsk>>>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::permission::ask::AskRequest>(4);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            log.lock()
+                .unwrap()
+                .push((req.tool.clone(), req.input.clone(), req.reason.clone()));
+            let _ = req.reply.send(decision.clone());
+        }
+    });
+    (tx, seen)
+}
+
+fn asking_hook(ask: Option<crate::permission::ask::AskSender>) -> BeforeToolCallFn {
+    let runner = ScriptedRunner::answering(vec![("guard", Ok(exit(0, &ask_json("risky"), "")))]);
+    let hooks = registry(config(&[(HookEvent::PreToolUse, None, &["guard"])]), runner);
+    loop_hooks::pre_tool_hook(HookBinding::main(hooks).with_ask(ask), None)
+}
+
+#[test]
+fn ask_decision_asks_with_its_reason() {
+    let out = policy::interpret(HookEvent::PreToolUse, exit(0, &ask_json("risky"), "")).unwrap();
+    assert_eq!(out.ask.as_deref(), Some("risky"));
+    assert_eq!(out.block, None);
+    assert!(out.context.is_empty());
+}
+
+#[test]
+fn a_block_outranks_an_ask_and_the_first_ask_wins() {
+    let asked = HookOutcome::asked("first").combine(HookOutcome::asked("second"));
+    assert_eq!(asked.pending_ask(), Some("first"));
+    let blocked = asked.combine(HookOutcome::blocked("no"));
+    assert_eq!(blocked.pending_ask(), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_tool_ask_allowed_at_the_prompt_runs_the_call() {
+    let (tx, seen) = prompt_answering(UserDecision::AllowOnce);
+    let ret = asking_hook(Some(tx))(before_ctx("bash", json!({ "command": "rm -rf build" }))).await;
+    assert!(ret.result.is_none());
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "Bash");
+    assert_eq!(seen[0].1, "rm -rf build");
+    assert!(seen[0].2.as_deref().unwrap().contains("risky"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_tool_ask_denied_at_the_prompt_blocks_with_the_note() {
+    let (tx, _) = prompt_answering(UserDecision::Deny {
+        note: Some("use make clean".into()),
+    });
+    let ret = asking_hook(Some(tx))(before_ctx("bash", json!({ "command": "rm -rf build" }))).await;
+    let result = ret.result.expect("blocked");
+    assert_eq!(result.block, Some(true));
+    assert_eq!(
+        result.reason.as_deref(),
+        Some("PreToolUse:Bash hook error: risky; the user denied it: use make clean")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_tool_ask_without_a_prompt_blocks() {
+    let ret = asking_hook(None)(before_ctx("bash", json!({ "command": "ls" }))).await;
+    let reason = ret.result.expect("blocked").reason.unwrap();
+    assert!(reason.contains("risky"));
+    assert!(reason.contains("no permission prompt"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn compose_before_short_circuits_on_first_block() {
     let runner = ScriptedRunner::answering(vec![]);
@@ -521,4 +769,55 @@ fn shell_runner_times_out() {
         ShellRunner.run(&slow, "{}", Path::new("/tmp")),
         Err(HookError::TimedOut(1))
     );
+}
+
+// ------------------------------------------------------ prompt submission
+
+#[test]
+fn submission_passes_the_prompt_through_when_no_hook_speaks() {
+    assert_eq!(
+        policy::submission(HookOutcome::default(), "hello".into()),
+        Submission::Proceed("hello".into())
+    );
+}
+
+#[test]
+fn submission_prepends_context() {
+    let Submission::Proceed(text) =
+        policy::submission(HookOutcome::with_context("ticket 42"), "hello".into())
+    else {
+        panic!("context alone must not block");
+    };
+    assert!(text.contains("ticket 42"), "{text}");
+    assert!(text.ends_with("hello"), "the prompt stays last: {text}");
+}
+
+#[test]
+fn submission_block_wins_over_context_and_drops_the_prompt() {
+    let outcome =
+        HookOutcome::with_context("ticket 42").combine(HookOutcome::blocked("no secrets"));
+    let Submission::Blocked(message) = policy::submission(outcome, "my password is x".into())
+    else {
+        panic!("a block must stop the run");
+    };
+    assert!(
+        message.contains("UserPromptSubmit") && message.contains("no secrets"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("my password is x"),
+        "a blocked prompt is not echoed back: {message}"
+    );
+}
+
+#[test]
+fn a_blocking_prompt_hook_yields_blocked_not_a_rewritten_prompt() {
+    let runner = ScriptedRunner::answering(vec![("gate", Ok(exit(2, "", "no secrets")))]);
+    let hooks = registry(
+        config(&[(HookEvent::UserPromptSubmit, None, &["gate"])]),
+        runner.clone(),
+    );
+    let submitted = loop_hooks::submitted_prompt(&hooks, Some("s-1"), "my password is x".into());
+    assert!(matches!(submitted, Submission::Blocked(ref m) if m.contains("no secrets")));
+    assert_eq!(runner.seen()[0].1["prompt"], "my password is x");
 }
