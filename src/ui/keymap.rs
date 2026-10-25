@@ -87,6 +87,15 @@ pub enum KeyAction {
     /// to the main screen and mouse reporting died (wheel scrolls native
     /// scrollback, selection uncaptured) — conventional Ctrl+L "redraw".
     RedrawTerminal,
+    /// Ask the external panel producer to show its next view.
+    PanelNextTab,
+    /// Ask the external panel producer to show its previous view.
+    PanelPrevTab,
+    /// Ask the external panel producer to repaint everything it shows.
+    PanelRefresh,
+    /// Open or close the swarm view: the external panels as a
+    /// full-screen grid instead of the compact left-panel boxes.
+    ToggleSwarm,
 }
 
 impl Command for KeyAction {
@@ -163,6 +172,38 @@ impl Command for KeyAction {
             KeyAction::RedrawTerminal,
             "redraw_terminal",
             &[(KeyCode::Char('l'), KeyModifiers::CONTROL)],
+        ),
+        // External panel replies. Alt+`]`/`[` are unusable: they are the
+        // introducers of terminal reports and CSI, so the punctuation
+        // pair next to them on the keyboard is used instead.
+        (
+            KeyAction::PanelNextTab,
+            "panel_next_tab",
+            &[(KeyCode::Char('.'), KeyModifiers::ALT)],
+        ),
+        (
+            KeyAction::PanelPrevTab,
+            "panel_prev_tab",
+            &[(KeyCode::Char(','), KeyModifiers::ALT)],
+        ),
+        (
+            KeyAction::PanelRefresh,
+            "panel_refresh",
+            &[(KeyCode::Char('/'), KeyModifiers::ALT)],
+        ),
+        (
+            KeyAction::ToggleSwarm,
+            "toggle_swarm",
+            // Alt+Shift+S too: legacy terminals report it as `S`+Alt,
+            // kitty-protocol ones as `S`+Alt+Shift.
+            &[
+                (KeyCode::Char('s'), KeyModifiers::ALT),
+                (KeyCode::Char('S'), KeyModifiers::ALT),
+                (
+                    KeyCode::Char('S'),
+                    KeyModifiers::ALT.union(KeyModifiers::SHIFT),
+                ),
+            ],
         ),
     ];
 }
@@ -754,6 +795,67 @@ mod tests {
             km.resolve(&ev(KeyCode::Char('l'), KeyModifiers::CONTROL)),
             Some(KeyAction::RedrawTerminal)
         );
+    }
+
+    /// External panel replies sit on Alt+. / Alt+, / Alt+/ and shadow
+    /// no other default in either keymap.
+    #[test]
+    fn panel_reply_keys_collide_with_nothing() {
+        let km = Keymap::defaults();
+        let input = InputKeymap::defaults();
+        for (c, want) in [
+            ('.', KeyAction::PanelNextTab),
+            (',', KeyAction::PanelPrevTab),
+            ('/', KeyAction::PanelRefresh),
+        ] {
+            let key = ev(KeyCode::Char(c), KeyModifiers::ALT);
+            assert_eq!(km.resolve(&key), Some(want));
+            assert_eq!(input.resolve_lenient(&key), None);
+        }
+        for (_, _, chords) in KeyAction::ALL {
+            for chord in *chords {
+                let owners = KeyAction::ALL
+                    .iter()
+                    .filter(|(_, _, cs)| cs.contains(chord))
+                    .count();
+                assert_eq!(owners, 1, "{chord:?} bound twice");
+            }
+        }
+        assert_eq!(
+            KeyAction::from_command("panel-next-tab"),
+            Some(KeyAction::PanelNextTab)
+        );
+    }
+
+    /// The swarm grid toggles on Alt+S, which no other default in either
+    /// keymap uses, and is rebindable as `toggle_swarm`.
+    #[test]
+    fn alt_s_toggles_the_swarm_grid() {
+        let km = Keymap::defaults();
+        let key = ev(KeyCode::Char('s'), KeyModifiers::ALT);
+        assert_eq!(km.resolve(&key), Some(KeyAction::ToggleSwarm));
+        assert_eq!(InputKeymap::defaults().resolve_lenient(&key), None);
+        let owners = KeyAction::ALL
+            .iter()
+            .filter(|(_, _, cs)| cs.contains(&(KeyCode::Char('s'), KeyModifiers::ALT)))
+            .count();
+        assert_eq!(owners, 1);
+        assert_eq!(
+            KeyAction::from_command("toggle-swarm"),
+            Some(KeyAction::ToggleSwarm)
+        );
+        // Plain `s` stays text.
+        assert_eq!(
+            km.resolve(&ev(KeyCode::Char('s'), KeyModifiers::NONE)),
+            None
+        );
+        // Alt+Shift+S, in both terminal spellings.
+        for mods in [KeyModifiers::ALT, KeyModifiers::ALT | KeyModifiers::SHIFT] {
+            assert_eq!(
+                km.resolve(&ev(KeyCode::Char('S'), mods)),
+                Some(KeyAction::ToggleSwarm)
+            );
+        }
     }
 
     /// dirge-e59d: Alt+X drops queued interjections (Ctrl+X stays

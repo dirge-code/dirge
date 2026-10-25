@@ -247,6 +247,116 @@ pub fn unregister_subagent_abort(id: &str) {
     map.remove(id);
 }
 
+/// Queue a tooled subagent polls at each turn boundary for steering text.
+/// Same shape as the main agent's interjection queue, so the loop's
+/// `steering_from_queue` drains it unchanged.
+pub type SubagentSteeringQueue =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+/// One in-flight tooled subagent's steering state: the queue its loop
+/// drains, plus every message sent to it, so the completion report can tell
+/// the parent agent what the user asked for mid-run.
+struct SteeringEntry {
+    queue: SubagentSteeringQueue,
+    sent: Vec<String>,
+}
+
+/// Process-global map from in-flight tooled subagent id to its steering
+/// state. Keyed like [`SUBAGENT_ABORT_REGISTRY`], so the UI can resolve a
+/// focused tab (or a `/msg` prefix) to the same id it kills with. Tool-less
+/// subagents are a single completion call and never register here.
+static SUBAGENT_STEERING_REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, SteeringEntry>>> =
+    std::sync::OnceLock::new();
+
+fn steering_registry() -> &'static Mutex<HashMap<String, SteeringEntry>> {
+    SUBAGENT_STEERING_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Create and register a steering queue for subagent `id`, returning it for
+/// the runner's `LoopSpawnConfig::steering_queue`.
+pub fn register_subagent_steering(id: &str) -> SubagentSteeringQueue {
+    let queue: SubagentSteeringQueue = Default::default();
+    steering_registry().lock_ignore_poison().insert(
+        id.to_string(),
+        SteeringEntry {
+            queue: queue.clone(),
+            sent: Vec::new(),
+        },
+    );
+    queue
+}
+
+/// Drop subagent `id`'s steering queue. Text still queued is discarded: the
+/// subagent reached a terminal state and will never poll it again.
+pub fn unregister_subagent_steering(id: &str) {
+    steering_registry().lock_ignore_poison().remove(id);
+}
+
+/// Take the messages sent to subagent `id` so far, leaving its log empty.
+pub fn take_subagent_messages(id: &str) -> Vec<String> {
+    steering_registry()
+        .lock_ignore_poison()
+        .get_mut(id)
+        .map(|entry| std::mem::take(&mut entry.sent))
+        .unwrap_or_default()
+}
+
+/// Append the messages the user sent a subagent mid-run to its result. The
+/// messages reach only the subagent, so without this the parent reads a
+/// report that answers instructions it never saw.
+fn with_user_messages(mut text: String, sent: &[String]) -> String {
+    if sent.is_empty() {
+        return text;
+    }
+    text.push_str("\n\n[The user messaged this subagent while it ran:");
+    for (i, message) in sent.iter().enumerate() {
+        text.push_str(&format!("\n{}. {}", i + 1, message));
+    }
+    text.push(']');
+    text
+}
+
+/// Result of [`message_subagent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageOutcome {
+    /// Queued for the subagent's next turn boundary. Carries the full id.
+    Queued(String),
+    /// No steerable subagent matches: it finished, or it is tool-less.
+    NotFound,
+    /// The prefix matches several subagents.
+    Ambiguous(Vec<String>),
+}
+
+/// Queue `text` for the in-flight subagent whose id matches `id_prefix`,
+/// using the same resolution rules as [`kill_subagent`]. The subagent sees
+/// it as a user message at its next turn boundary.
+pub fn message_subagent(id_prefix: &str, text: &str) -> MessageOutcome {
+    let trimmed = id_prefix.trim();
+    if trimmed.is_empty() || text.trim().is_empty() {
+        return MessageOutcome::NotFound;
+    }
+    let mut map = steering_registry().lock_ignore_poison();
+    let id = if map.contains_key(trimmed) {
+        trimmed.to_string()
+    } else {
+        let matches: Vec<String> = map
+            .keys()
+            .filter(|k| k.starts_with(trimmed))
+            .cloned()
+            .collect();
+        match matches.len() {
+            0 => return MessageOutcome::NotFound,
+            1 => matches.into_iter().next().unwrap(),
+            _ => return MessageOutcome::Ambiguous(matches),
+        }
+    };
+    if let Some(entry) = map.get_mut(&id) {
+        entry.queue.lock_ignore_poison().push_back(text.to_string());
+        entry.sent.push(text.to_string());
+    }
+    MessageOutcome::Queued(id)
+}
+
 /// Bridge a registered `AbortSignal` (driven by `/kill` / Ctrl+K) to a tooled
 /// subagent's `AgentRunner`. The tool-less path polls the signal inline
 /// (`tokio::select!` around `btw_query`); the tooled path drives a real
@@ -319,6 +429,7 @@ impl Drop for SubagentCleanup {
             watcher.abort();
         }
         unregister_subagent_abort(&self.id);
+        unregister_subagent_steering(&self.id);
         if let Some(store) = &self.store {
             store.notify_if_running(
                 &self.id,
@@ -1229,6 +1340,7 @@ impl TaskTool {
                         &child_sid,
                         max_turns,
                         model_for_task.as_ref(),
+                        Some(register_subagent_steering(&tid_for_task)),
                     )
                 } else {
                     agent.spawn_subagent_runner(
@@ -1239,6 +1351,7 @@ impl TaskTool {
                         &child_sid,
                         max_turns,
                         model_for_task.as_ref(),
+                        Some(register_subagent_steering(&tid_for_task)),
                     )
                 };
                 let abort_watcher = spawn_abort_watcher(
@@ -1263,7 +1376,16 @@ impl TaskTool {
                 let outer = tokio::time::timeout(route_timeout, drained).await;
                 let aborted = abort_for_task.is_cancelled();
                 let (state, chat_event) = match outer {
-                    Ok(Ok(text)) => (TaskState::Completed(text), None),
+                    Ok(Ok(text)) => {
+                        // A cheap-model digest replaces the head/tail excerpt
+                        // the store would otherwise relay for a large result.
+                        let delivered = crate::agent::tools::subagent_digest::try_digest(&text)
+                            .await
+                            .unwrap_or(text);
+                        let delivered =
+                            with_user_messages(delivered, &take_subagent_messages(&tid_for_task));
+                        (TaskState::Completed(delivered), None)
+                    }
                     Ok(Err(e)) => {
                         let aborted_msg = "aborted by user".to_string();
                         if aborted {
@@ -1354,6 +1476,7 @@ impl TaskTool {
                 &child_sid,
                 max_turns,
                 route_model.as_ref(),
+                Some(register_subagent_steering(&task_id)),
             );
             let abort_watcher = spawn_abort_watcher(
                 abort.clone(),
@@ -1371,9 +1494,15 @@ impl TaskTool {
             let aborted = abort.is_cancelled();
             match result {
                 Ok(Ok(text)) => {
+                    let sent = take_subagent_messages(&task_id);
+                    if let Some(digest) =
+                        crate::agent::tools::subagent_digest::try_digest(&text).await
+                    {
+                        return Ok(with_user_messages(digest, &sent));
+                    }
                     let outcome =
                         crate::agent::tools::output_relay::relay_if_large("task", text, "");
-                    Ok(outcome.text)
+                    Ok(with_user_messages(outcome.text, &sent))
                 }
                 Ok(Err(e)) => {
                     if aborted {
@@ -1702,7 +1831,11 @@ impl PortableTool for TaskTool {
                 let outer = tokio::time::timeout(route_timeout, raced).await;
                 let (state, chat_event) = match outer {
                     Ok(Ok(Ok(text))) => (
-                        TaskState::Completed(text.clone()),
+                        TaskState::Completed(
+                            crate::agent::tools::subagent_digest::try_digest(&text)
+                                .await
+                                .unwrap_or_else(|| text.clone()),
+                        ),
                         SubagentChatEvent::Token {
                             id: tid_for_task.clone(),
                             text: text.clone(),
@@ -1837,6 +1970,11 @@ impl PortableTool for TaskTool {
                         id: task_id,
                         result: text.clone(),
                     });
+                    if let Some(digest) =
+                        crate::agent::tools::subagent_digest::try_digest(&text).await
+                    {
+                        return Ok(digest);
+                    }
                     let outcome =
                         crate::agent::tools::output_relay::relay_if_large("task", text, "");
                     Ok(outcome.text)
@@ -2724,6 +2862,58 @@ mod tests {
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await
+    }
+
+    /// `/msg` and focused-tab input: a unique prefix queues onto that
+    /// subagent's steering queue; an ambiguous or unknown prefix, or a
+    /// finished subagent, queues nothing.
+    #[test]
+    fn message_subagent_resolves_prefix_and_queues() {
+        let a = register_subagent_steering("msgtest-aaa-1");
+        let b = register_subagent_steering("msgtest-aab-2");
+        assert_eq!(
+            message_subagent("msgtest-aaa", "look at foo.rs"),
+            MessageOutcome::Queued("msgtest-aaa-1".into())
+        );
+        assert_eq!(
+            a.lock_ignore_poison().drain(..).collect::<Vec<_>>(),
+            vec!["look at foo.rs".to_string()]
+        );
+        assert!(matches!(
+            message_subagent("msgtest-aa", "x"),
+            MessageOutcome::Ambiguous(ids) if ids.len() == 2
+        ));
+        assert_eq!(
+            message_subagent("msgtest-zzz", "x"),
+            MessageOutcome::NotFound
+        );
+        assert_eq!(
+            message_subagent("msgtest-aab", "  "),
+            MessageOutcome::NotFound
+        );
+        assert!(b.lock_ignore_poison().is_empty());
+        assert_eq!(
+            take_subagent_messages("msgtest-aaa-1"),
+            vec!["look at foo.rs".to_string()]
+        );
+        assert!(take_subagent_messages("msgtest-aaa-1").is_empty());
+        unregister_subagent_steering("msgtest-aaa-1");
+        unregister_subagent_steering("msgtest-aab-2");
+        assert_eq!(
+            message_subagent("msgtest-aaa-1", "x"),
+            MessageOutcome::NotFound
+        );
+    }
+
+    /// The parent only sees what the subagent returns, so messages sent to
+    /// it mid-run ride along as a numbered footer; none adds nothing.
+    #[test]
+    fn with_user_messages_appends_numbered_footer() {
+        assert_eq!(with_user_messages("done".into(), &[]), "done");
+        assert_eq!(
+            with_user_messages("done".into(), &["a".into(), "b".into()]),
+            "done\n\n[The user messaged this subagent while it ran:\n1. a\n2. b]"
+        );
     }
 
     /// `/kill` against an empty registry or a never-spawned prefix

@@ -116,7 +116,7 @@ impl CommandHooks {
                 self.judge(event, cmd, &payload).unwrap_or_else(|e| {
                     tracing::warn!(
                         target: "dirge::hooks",
-                        event = %event, command = %cmd.command, error = %e,
+                        event = %event, command = %cmd.label(), error = %e,
                         "hook produced no verdict, action allowed",
                     );
                     HookOutcome::default()

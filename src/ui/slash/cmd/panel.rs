@@ -1,6 +1,6 @@
-//! /panel and /display handlers.
+//! /panel vigil-mode handler.
 
-use crate::ui::renderer::{PanelMode, parse_display_spec};
+use crate::ui::renderer::PanelMode;
 use crate::ui::slash::{SlashCtx, c_agent, c_error};
 
 pub(crate) async fn cmd_panel(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
@@ -48,47 +48,5 @@ pub(crate) async fn cmd_panel(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         ),
         c_agent(),
     )?;
-    Ok(())
-}
-
-pub(crate) async fn cmd_display(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
-    let spec = parts[1..].join(" ");
-    if spec.trim().is_empty() {
-        let left = ctx.renderer.left_panel_visible();
-        let right = ctx.renderer.right_panel_visible();
-        let mut shown = vec!["main"];
-        if left {
-            shown.insert(0, "left");
-        }
-        if right {
-            shown.push("right");
-        }
-        ctx.renderer.write_line(
-            &format!(
-                "display: {} (usage: /display left|main|right)",
-                shown.join("|")
-            ),
-            c_agent(),
-        )?;
-        return Ok(());
-    }
-    match parse_display_spec(&spec) {
-        Ok(vis) => {
-            ctx.renderer.set_pane_visibility(vis);
-            ctx.renderer.render_viewport()?;
-            let mut shown = vec!["main"];
-            if vis.left {
-                shown.insert(0, "left");
-            }
-            if vis.right {
-                shown.push("right");
-            }
-            ctx.renderer
-                .write_line(&format!("display: {}", shown.join("|")), c_agent())?;
-        }
-        Err(msg) => {
-            ctx.renderer.write_line(&msg, c_error())?;
-        }
-    }
     Ok(())
 }

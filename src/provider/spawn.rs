@@ -214,12 +214,32 @@ impl AnyAgent {
                 self.session_id.as_deref(),
                 !history.is_empty(),
             );
-            prompt.text = crate::agent::command_hooks::loop_hooks::submitted_prompt(
+            use crate::agent::command_hooks::domain::Submission;
+            match crate::agent::command_hooks::loop_hooks::submitted_prompt(
                 hooks,
                 self.session_id.as_deref(),
                 prompt.text,
-            );
+            ) {
+                Submission::Proceed(text) => prompt.text = text,
+                Submission::Blocked(message) => return AgentRunner::refused(message),
+            }
         }
+        // The session's start and the addon prompt hooks open the run inside
+        // its task, off this thread: they may wait on addon code and MCP.
+        let first_prompt = history.is_empty();
+        let open_run = crate::agent::session_lifecycle::installed().map(|lifecycle| {
+            lifecycle.open_run(crate::agent::session_lifecycle::collect::start_facts(
+                self.session_id.as_deref(),
+                first_prompt,
+            ))
+        });
+        let addon_hooks = crate::agent::addon_hooks::installed();
+        let open_run = crate::agent::agent_loop::hooks::compose_open_run(
+            open_run,
+            addon_hooks
+                .as_ref()
+                .and_then(|addons| addons.open_run(self.session_id.clone(), first_prompt)),
+        );
 
         // Convert rig history → loop messages (Session-side
         // user/assistant/toolResult shapes).
@@ -232,6 +252,9 @@ impl AnyAgent {
         cfg.provider_name = Some(provider_name);
         cfg.model_name = Self::model_name_opt(&self.model_name);
         cfg.steering_queue = steering_queue;
+        // The main session's runs take external loop directives (hive
+        // senses from the panel feed) once a producer armed the inbox.
+        cfg.loop_inbox = crate::agent::agent_loop::loop_inbox::installed();
         cfg.tool_def_filter = tool_def_filter;
         cfg.dynamic_tool_search = self.dynamic_tool_search;
         cfg.turn_envelope = self.turn_envelope;
@@ -331,7 +354,11 @@ impl AnyAgent {
         // auto-compaction can fire on_pre_compress. `None` paths
         // (no provider attached) keep legacy no-op behavior.
         cfg.memory_provider = self.memory_provider.clone();
-        cfg.command_hooks = command_hooks.map(crate::agent::command_hooks::HookBinding::main);
+        cfg.command_hooks = command_hooks.map(|h| {
+            crate::agent::command_hooks::HookBinding::main(h).with_ask(self.hook_ask_tx.clone())
+        });
+        cfg.addon_hooks = addon_hooks;
+        cfg.open_run = open_run;
         #[cfg(feature = "plugin")]
         {
             cfg.plugin_mgr = crate::plugin::hook::global();
@@ -549,6 +576,7 @@ impl AnyAgent {
     }
 
     /// Fork a subagent using a freshly built, isolated tool registry.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_subagent_runner_with_tools(
         &self,
         prompt: String,
@@ -557,6 +585,7 @@ impl AnyAgent {
         child_session_id: &str,
         max_turns: usize,
         model_override: Option<&AnyModel>,
+        steering: Option<crate::agent::tools::task::SubagentSteeringQueue>,
     ) -> crate::agent::runner::AgentRunner {
         use crate::agent::agent_loop::{LoopSpawnConfig, retrying_stream_fn, spawn_loop_runner};
         use crate::agent::recovery::RecoveryPolicy;
@@ -589,7 +618,9 @@ impl AnyAgent {
             prompt,
         );
         cfg.system_prompt = system_prompt;
-        cfg.command_hooks = command_hooks.map(crate::agent::command_hooks::HookBinding::subagent);
+        cfg.command_hooks = command_hooks.map(|h| {
+            crate::agent::command_hooks::HookBinding::subagent(h).with_ask(self.hook_ask_tx.clone())
+        });
         cfg.tools = tools;
         cfg.provider_name = Some(provider);
         cfg.reasoning = self.reasoning;
@@ -602,6 +633,9 @@ impl AnyAgent {
         };
         cfg.session_id = Some(child_session_id.to_string());
         cfg.max_turns = Some(max_turns);
+        // Text the user sends to this subagent (focused-tab input, `/msg`)
+        // lands here and is injected at the next turn boundary.
+        cfg.steering_queue = steering;
         spawn_loop_runner(cfg).into_agent_runner()
     }
 
@@ -634,6 +668,7 @@ impl AnyAgent {
         // `None` uses the live agent's model. Either way the TOOL SET comes
         // from the live agent (the parent's filtered registry).
         model_override: Option<&AnyModel>,
+        steering: Option<crate::agent::tools::task::SubagentSteeringQueue>,
     ) -> crate::agent::runner::AgentRunner {
         // Union the tier-capped built-in allow-list with the profile's MCP
         // selection. `resolve_mcp_selection` intersects the request with the
@@ -659,6 +694,7 @@ impl AnyAgent {
             child_session_id,
             max_turns,
             model_override,
+            steering,
         )
     }
 

@@ -47,6 +47,7 @@ pub mod integration;
 #[cfg(test)]
 mod integration_tests;
 pub mod intervention;
+pub mod loop_inbox;
 pub mod message;
 #[cfg(feature = "plugin")]
 pub mod plugin_hooks;

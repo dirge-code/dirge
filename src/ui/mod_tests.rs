@@ -51,7 +51,54 @@ fn subagent_panel_spawn_inserts_running_row() {
     );
     assert_eq!(rows.len(), 1);
     let agent = rows.get("abc123").unwrap();
-    assert_eq!(agent, &Some("dev".to_string()));
+    assert_eq!(agent.agent, Some("dev".to_string()));
+    assert_eq!(agent.activity, None);
+}
+
+/// ToolCall → the row's preview becomes that call and the count grows;
+/// reasoning only fills an empty preview, never overwrites a call.
+#[test]
+fn subagent_panel_tool_call_updates_preview() {
+    let mut rows = indexmap::IndexMap::new();
+    apply_subagent_panel_event(
+        &mut rows,
+        &E::Spawn {
+            id: "abc123".into(),
+            prompt: "p".into(),
+            agent: None,
+        },
+    );
+    apply_subagent_panel_event(
+        &mut rows,
+        &E::Reasoning {
+            id: "abc123".into(),
+            text: "hmm".into(),
+        },
+    );
+    assert_eq!(rows["abc123"].activity.as_deref(), Some("thinking…"));
+    for path in ["a.rs", "b.rs"] {
+        apply_subagent_panel_event(
+            &mut rows,
+            &E::ToolCall {
+                id: "abc123".into(),
+                tool_name: "read".into(),
+                args_summary: format!("path={path}"),
+            },
+        );
+    }
+    apply_subagent_panel_event(
+        &mut rows,
+        &E::Reasoning {
+            id: "abc123".into(),
+            text: "more".into(),
+        },
+    );
+    let row = &rows["abc123"];
+    assert_eq!(row.activity.as_deref(), Some("read path=b.rs"));
+    assert_eq!(row.tool_calls, 2);
+    let status = row.status_row("abc123");
+    assert_eq!(status.tool_calls, 2);
+    assert_eq!(status.activity.as_deref(), Some("read path=b.rs"));
 }
 
 /// Complete → row is REMOVED (the bug being fixed). Previously

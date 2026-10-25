@@ -44,7 +44,7 @@ use super::build_session_search_tool;
 ///
 /// Single source of truth for the collision policy, previously inlined
 /// verbatim at three sites (MCP eager + MCP background + plugin) [dirge-p99h].
-#[cfg(any(feature = "mcp", feature = "plugin"))]
+/// Addon tools answer to it too.
 fn shadows_builtin(name: &str, source: &str) -> bool {
     if tools::reserves_builtin_name(name) {
         eprintln!(
@@ -206,44 +206,6 @@ pub(crate) async fn register_spec_tool(
             );
         }
     }
-}
-
-/// dirge-4hld: build the embeddings-backed retriever when hybrid memory is
-/// configured. Returns `None` (→ BM25-only) unless `hybrid_retrieval` is on
-/// AND an embeddings endpoint is set, so the default and misconfigured cases
-/// degrade silently to the builtin store.
-fn resolve_embedder(
-    cfg: &crate::config::MemoryConfig,
-) -> Option<std::sync::Arc<dyn crate::extras::memory_hybrid::Embedder>> {
-    if cfg.hybrid_retrieval != Some(true) {
-        return None;
-    }
-    let Some(url) = cfg.embed_url.clone() else {
-        // The most common misconfiguration: hybrid on, but no endpoint. Warn
-        // instead of silently staying BM25 with no feedback (dirge-4hld).
-        tracing::warn!(
-            target: "dirge::memory_hybrid",
-            "memory.hybrid_retrieval is on but memory.embed_url is unset — staying BM25-only",
-        );
-        return None;
-    };
-    let model = cfg
-        .embed_model
-        .clone()
-        .unwrap_or_else(|| crate::extras::memory_hybrid::DEFAULT_EMBED_MODEL.to_string());
-    let api_key = cfg
-        .embed_api_key_env
-        .as_ref()
-        .and_then(|var| std::env::var(var).ok());
-    // Surface the active backend once so a misconfigured url/model (e.g. a
-    // non-OpenAI endpoint left on the default model id) is visible in logs
-    // rather than only as a silent BM25 fallback.
-    tracing::info!(
-        target: "dirge::memory_hybrid",
-        url = %url, model = %model, keyed = api_key.is_some(),
-        "hybrid memory retrieval enabled",
-    );
-    crate::extras::memory_hybrid::api_embedder(url, model, api_key)
 }
 
 /// Build an isolated registry for a writer working in a worktree.
@@ -527,7 +489,7 @@ pub async fn build_loop_tools(
     // returns `Arc<dyn MemoryProvider>` so plugin backends can plug
     // in without churning the call sites.
     // dirge-4hld: wrap the BM25 store in the hybrid retriever when configured.
-    let mem_cfg = cfg.memory.clone().unwrap_or_default();
+    let mem_cfg = cfg.memory_config();
     // dirge-0gxb: latch the verbatim pre-recall toggle for the loop to read.
     crate::agent::agent_loop::context_manager::set_verbatim_pre_recall(
         mem_cfg.verbatim_pre_recall == Some(true),
@@ -535,29 +497,14 @@ pub async fn build_loop_tools(
     let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
         if let Ok(c) = std::env::current_dir() {
             let paths = crate::extras::dirge_paths::ProjectPaths::new(&c);
+            let project_cfg = mem_cfg.clone();
             tokio::task::spawn_blocking(move || {
-                crate::extras::memory_db::SqliteMemoryStore::load(&paths)
-                    .ok()
-                    .map(|s| {
-                        let inner = Arc::new(s);
-                        match resolve_embedder(&mem_cfg) {
-                            Some(embedder) => {
-                                let hybrid: Arc<
-                                    dyn crate::extras::memory_provider::MemoryProvider,
-                                > = Arc::new(
-                                    crate::extras::memory_hybrid::HybridMemoryProvider::new(
-                                        inner, embedder,
-                                    ),
-                                );
-                                hybrid
-                            }
-                            None => {
-                                let arc: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
-                                    inner;
-                                arc
-                            }
-                        }
-                    })
+                crate::extras::memory_provider::build(
+                    &project_cfg,
+                    crate::extras::memory_provider::MemoryScope::Project(&paths),
+                    crate::extras::memory_provider::Retrieval::AsConfigured,
+                )
+                .ok()
             })
             .await
             .unwrap_or_default()
@@ -849,9 +796,12 @@ pub async fn build_loop_tools(
     // the user across repos. Best-effort: a load failure just means no
     // global scope this session.
     let global_store: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
-        crate::extras::memory_db::SqliteMemoryStore::load_global()
-            .ok()
-            .map(|s| std::sync::Arc::new(s) as _);
+        crate::extras::memory_provider::build(
+            &mem_cfg,
+            crate::extras::memory_provider::MemoryScope::Global,
+            crate::extras::memory_provider::Retrieval::Plain,
+        )
+        .ok();
     // dirge-ygm3: build the review-enabled memory tool BEFORE `global_store` is
     // moved into the main registration. It is returned separately, never added
     // to `tools`.
@@ -1083,6 +1033,29 @@ pub async fn build_loop_tools(
                 tools.push(Arc::new(adapter));
                 plugin_tool_names.push(meta_name);
             }
+        }
+    }
+
+    // Clojure IAddon tools, after Janet plugin tools, under the rule
+    // `AnyAgent::upsert_loop_tools` applies on `/addons reload`: a built-in
+    // name always wins, and so does any tool registered above.
+    if let Some(addons) = crate::agent::addon_hooks::installed() {
+        let mut taken: std::collections::HashSet<String> =
+            tools.iter().map(|t| t.name().to_string()).collect();
+        for tool in addons.loop_tools(permission.clone(), ask_tx.clone()) {
+            let name = tool.name().to_string();
+            if shadows_builtin(&name, "addon") {
+                continue;
+            }
+            if !taken.insert(name.clone()) {
+                tracing::warn!(
+                    target: "dirge::addon",
+                    tool = %name,
+                    "addon tool skipped: another tool already uses that name"
+                );
+                continue;
+            }
+            tools.push(tool);
         }
     }
 

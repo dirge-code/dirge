@@ -3,6 +3,14 @@ id = "RUSTSEC-2025-0057"
 reason = "fxhash is a transitive dep of bm25; no maintained fork exists that preserves the required hash32/hash64 API"
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2023-0089"
+reason = "atomic-polyfill (unmaintained, no vulnerability) is a transitive dep of cljrs-ir via postcard -> heapless 0.7; not reachable from dirge's manifest"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2020-0168"
+reason = "mach (unmaintained, no vulnerability) is a transitive dep of cljrs-gc via system-memory, compiled only on macOS; not reachable from dirge's manifest"
+
+[[IgnoredVulns]]
 id = "RUSTSEC-2024-0384"
 reason = "instant is a transitive dep of notify-types → notify (dirge's watch dep); unmaintained, no drop-in fork yet — notify maintainers are tracking web-time migration"
 

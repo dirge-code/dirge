@@ -26,17 +26,20 @@ mod tests;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-pub use boundary::ShellRunner;
 pub use domain::{HookEvent, HooksConfig};
 pub use registry::CommandHooks;
 
-/// Hooks attached to one loop: the registry plus the event that fires
+use crate::permission::ask::AskSender;
+
+/// Hooks attached to one loop: the registry, the event that fires
 /// when that loop is about to finish (`Stop` for the main agent,
-/// `SubagentStop` for a forked child).
+/// `SubagentStop` for a forked child), and the permission prompt a
+/// `PreToolUse` "ask" is routed to (`None` denies it: nobody to ask).
 #[derive(Clone, Debug)]
 pub struct HookBinding {
     pub hooks: Arc<CommandHooks>,
     pub stop_event: HookEvent,
+    pub ask: Option<AskSender>,
 }
 
 impl HookBinding {
@@ -44,6 +47,7 @@ impl HookBinding {
         Self {
             hooks,
             stop_event: HookEvent::Stop,
+            ask: None,
         }
     }
 
@@ -51,7 +55,13 @@ impl HookBinding {
         Self {
             hooks,
             stop_event: HookEvent::SubagentStop,
+            ask: None,
         }
+    }
+
+    pub fn with_ask(mut self, ask: Option<AskSender>) -> Self {
+        self.ask = ask;
+        self
     }
 }
 
@@ -67,7 +77,7 @@ pub fn install_from_config(cfg: &crate::config::Config) {
         cfg.claude_hooks.unwrap_or(false),
         crate::extras::dirge_paths::project_root(&cwd),
         home.as_deref(),
-        Arc::new(ShellRunner),
+        Arc::new(boundary::DispatchRunner::live()),
     );
     if hooks.is_empty() {
         return;

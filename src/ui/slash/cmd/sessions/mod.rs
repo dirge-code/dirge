@@ -167,6 +167,7 @@ pub(crate) async fn swap_to_session(ctx: &mut SlashCtx<'_>, next: Session) -> an
         store.cancel_all();
     }
     crate::agent::review::maybe_fire_session_end(ctx.agent, ctx.session);
+    crate::agent::session_lifecycle::end(crate::agent::session_lifecycle::EndCause::Switch).await;
     let old_id = ctx.session.id.to_string();
     *ctx.session = next;
     crate::agent::review::maybe_fire_session_switch(ctx.agent, &ctx.session.id, &old_id, false);
