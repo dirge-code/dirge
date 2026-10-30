@@ -73,7 +73,7 @@ Accepted top-level keys:
 
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, `cerebras`, `opencode`, `kimi`/`kimi-code`/`moonshot`, `requesty`, `opper`, `cheaperinference`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
+| `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, `cerebras`, `opencode`, `kimi`/`kimi-code`/`moonshot`, `requesty`, `opper`, `cheaperinference`, `atmorouter`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
 | `auth`                    | string  | Default authentication source for providers that don't set their own `providers.<name>.auth`: `api-key` (the implicit default), `chatgpt` (Codex/OpenAI login tokens), `anthropic` / `claude-code` (Anthropic Claude Code OAuth), or `kimi` (Kimi Code device OAuth). See [Providers and roles](#providers-and-roles). |
 | `providers`               | object  | Map of provider alias → entry. The active model lives in `providers.<active-provider>.model`. Each role key below points at one of these aliases. See [Providers and roles](#providers-and-roles). |
 | `review_provider`         | string  | Provider alias for the background session-review pass. Falls back to `provider`. |
@@ -381,7 +381,7 @@ Each `providers` entry accepts:
 
 | Field | Description |
 |-------|-------------|
-| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `kimi`, `requesty`, `opper`, `cheaperinference`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
+| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `kimi`, `requesty`, `opper`, `cheaperinference`, `atmorouter`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
 | `base_url` | Endpoint base URL (for custom / self-hosted endpoints). |
 | `model` | Model name for this provider. |
 | `api_key` | Literal key or `${ENV_VAR}` interpolation. Takes precedence over `api_key_env`. |
@@ -633,6 +633,43 @@ another model, add only the model override and keep the secret in
 Requests go to `https://api.cheaperinference.com/v1`. Set
 `providers.cheaperinference.base_url` to point somewhere else; Dirge does not
 read a separate `CHEAPER_INFERENCE_BASE_URL` variable.
+
+Reasoning effort is sent as a top-level `reasoning_effort` (`low`, `medium`, or
+`high`), with lower and higher Dirge levels clamped to that set and the field
+omitted when reasoning is off.
+
+### AtmoRouter
+
+[AtmoRouter](https://atmorouter.dev) is a pay-as-you-go OpenAI-compatible
+gateway. One API key reaches models from several labs. Model ids carry a route
+prefix, such as `cc/claude-sonnet-4-6` or `cx/gpt-6-sol`; the full
+list is at `https://atmorouter.dev/v1/models`. It needs no `providers` entry.
+Create a key at <https://atmorouter.dev/signup>, export it and select the
+built-in:
+
+```bash
+export ATMOROUTER_API_KEY="..."
+dirge --provider atmorouter  # defaults to cc/claude-sonnet-4-6
+```
+
+AtmoRouter is never picked by key autodetection; select it with
+`--provider atmorouter` or `"provider": "atmorouter"`. To pin another model,
+add only the model override and keep the secret in `ATMOROUTER_API_KEY`:
+
+```json
+{
+  "provider": "atmorouter",
+  "providers": {
+    "atmorouter": {
+      "model": "cx/gpt-6-sol"
+    }
+  }
+}
+```
+
+Requests go to `https://atmorouter.dev/v1`. Set
+`providers.atmorouter.base_url` to point somewhere else; Dirge does not
+read a separate `ATMOROUTER_BASE_URL` variable.
 
 Reasoning effort is sent as a top-level `reasoning_effort` (`low`, `medium`, or
 `high`), with lower and higher Dirge levels clamped to that set and the field

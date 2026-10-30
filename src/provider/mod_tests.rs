@@ -263,6 +263,32 @@ fn cheaper_inference_builtin_name_is_protected_from_plugin_shadowing() {
     );
 }
 
+#[test]
+fn atmorouter_standard_key_lookup_uses_only_atmorouter_api_key() {
+    let kind = parse_provider("atmorouter").expect("atmorouter should be a built-in provider");
+    let key = resolve_api_key_from(
+        kind,
+        None,
+        None,
+        mock_env(&[("ATMOROUTER_API_KEY", "test-atmorouter-key")]),
+    )
+    .expect("standard AtmoRouter key should resolve");
+
+    assert_eq!(key, "test-atmorouter-key");
+    assert!(provider_env_var_fallbacks(kind).is_empty());
+}
+
+#[test]
+fn atmorouter_builtin_name_is_protected_from_plugin_shadowing() {
+    let err = validate_custom_provider("ATMOROUTER", "https://interceptor.invalid/v1", false, true)
+        .expect_err("plugins must not shadow the AtmoRouter built-in");
+
+    assert!(
+        err.contains("collides with built-in"),
+        "unexpected error: {err}"
+    );
+}
+
 /// No stored `dirge auth` login → no provider implied, so the
 /// caller falls through to the openrouter default.
 #[test]

@@ -254,6 +254,7 @@ fn resolve_provider_base_url(
         ProviderKind::Requesty => (None, Some("https://router.requesty.ai/v1")),
         ProviderKind::Opper => (None, Some("https://api.opper.ai/v3/compat")),
         ProviderKind::CheaperInference => (None, Some("https://api.cheaperinference.com/v1")),
+        ProviderKind::AtmoRouter => (None, Some("https://atmorouter.dev/v1")),
         ProviderKind::Kimi => (
             Some("KIMI_CODE_BASE_URL"),
             Some(crate::auth::kimi_device::KIMI_CODE_BASE_URL),
@@ -319,7 +320,7 @@ where
     } = request_context;
     let info = resolve_provider_info(provider_name, providers).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, deepseek, glm, cerebras, opencode, kimi, ollama, requesty, opper, cheaperinference, custom",
+            "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, deepseek, glm, cerebras, opencode, kimi, ollama, requesty, opper, cheaperinference, atmorouter, custom",
             provider_name
         )
     })?;
@@ -701,6 +702,17 @@ where
                 .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
             Ok(AnyClient::CheaperInference(b.build()?))
+        }
+        ProviderKind::AtmoRouter => {
+            let b = openai::CompletionsClient::builder()
+                .http_client(compressing(
+                    reqwest::Client::new(),
+                    ProviderKind::AtmoRouter,
+                ))
+                .api_key(&key)
+                .base_url(require_base_url(info.kind, base_url.as_deref())?)
+                .http_headers(headers);
+            Ok(AnyClient::AtmoRouter(b.build()?))
         }
         ProviderKind::Custom => {
             let base_url = base_url.ok_or_else(|| {
@@ -1143,6 +1155,7 @@ fn wire_kind(kind: ProviderKind) -> crate::llmtrim::ir::ProviderKind {
         | ProviderKind::Requesty
         | ProviderKind::Opper
         | ProviderKind::CheaperInference
+        | ProviderKind::AtmoRouter
         | ProviderKind::Custom => Wire::OpenAi,
     }
 }
@@ -1415,6 +1428,7 @@ mod tests {
                 ProviderKind::CheaperInference,
                 "https://api.cheaperinference.com/v1",
             ),
+            (ProviderKind::AtmoRouter, "https://atmorouter.dev/v1"),
             (
                 ProviderKind::Kimi,
                 crate::auth::kimi_device::KIMI_CODE_BASE_URL,
@@ -2579,6 +2593,70 @@ mod tests {
 
         assert!(
             message.contains("CHEAPER_INFERENCE_API_KEY"),
+            "unexpected error: {message}"
+        );
+        assert!(!message.contains("test-openai-key-must-not-leak"));
+    }
+
+    fn parsed_atmorouter_kind() -> ProviderKind {
+        crate::provider::parse_provider("atmorouter")
+            .expect("atmorouter should resolve through the production parser")
+    }
+
+    #[test]
+    fn atmorouter_default_base_url_is_api_v1() {
+        let got = resolve_provider_base_url(parsed_atmorouter_kind(), None, no_env)
+            .expect("AtmoRouter default URL should resolve");
+
+        assert_eq!(got.as_deref(), Some("https://atmorouter.dev/v1"));
+    }
+
+    #[test]
+    fn atmorouter_configured_https_base_url_overrides_default() {
+        let got = resolve_provider_base_url(
+            parsed_atmorouter_kind(),
+            Some("https://gateway.example.com/v1".to_string()),
+            no_env,
+        )
+        .expect("configured AtmoRouter URL should resolve");
+
+        assert_eq!(got.as_deref(), Some("https://gateway.example.com/v1"));
+    }
+
+    #[test]
+    fn atmorouter_client_builds_from_only_atmorouter_api_key() {
+        let client = create_client_with(
+            "atmorouter",
+            None,
+            &HashMap::new(),
+            |name| (name == "ATMOROUTER_API_KEY").then(|| "test-atmorouter-key".to_string()),
+            || Ok(None),
+        )
+        .expect("AtmoRouter client should build from its standard environment key");
+        let model = client.completion_model("cc/claude-sonnet-4-6");
+
+        assert_eq!(
+            (model.provider_name(), model.name()),
+            ("atmorouter", "cc/claude-sonnet-4-6".to_string()),
+        );
+    }
+
+    #[test]
+    fn atmorouter_missing_key_names_only_atmorouter_api_key() {
+        let result = create_client_with(
+            "atmorouter",
+            None,
+            &HashMap::new(),
+            |name| (name == "OPENAI_API_KEY").then(|| "test-openai-key-must-not-leak".to_string()),
+            || Ok(None),
+        );
+        let message = match result {
+            Ok(_) => panic!("AtmoRouter must not accept an OpenAI key"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            message.contains("ATMOROUTER_API_KEY"),
             "unexpected error: {message}"
         );
         assert!(!message.contains("test-openai-key-must-not-leak"));

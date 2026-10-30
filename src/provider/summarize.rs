@@ -84,6 +84,7 @@ pub(crate) async fn oneshot_with_model(
         super::AnyModel::CheaperInference(m) => {
             run_oneshot(m, label, preamble, prompt, disable).await
         }
+        super::AnyModel::AtmoRouter(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Custom(m) => run_oneshot(m, label, preamble, prompt, disable).await,
     }
 }
@@ -465,6 +466,7 @@ mod tests {
         assert_eq!(reasoning_disable_for_kind("requesty", None), None);
         assert_eq!(reasoning_disable_for_kind("opper", None), None);
         assert_eq!(reasoning_disable_for_kind("cheaperinference", None), None);
+        assert_eq!(reasoning_disable_for_kind("atmorouter", None), None);
     }
 
     #[test]

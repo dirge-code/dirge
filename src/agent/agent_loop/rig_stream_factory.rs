@@ -1226,6 +1226,7 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
 ///     ignores the nested `reasoning` object.
 ///   - "opper": same top-level shape and clamping as cerebras.
 ///   - "cheaperinference": same top-level shape and clamping as cerebras.
+///   - "atmorouter": same top-level shape and clamping as cerebras.
 ///   - "openai" / "custom" (openai-shaped): `{ "reasoning":
 ///     { "effort": "low" | "medium" | "high" | "xhigh" | "max" } }`
 ///     per OpenAI Responses spec — Xhigh and Max pass through
@@ -3102,6 +3103,30 @@ mod tests {
         let opts = opts_with_reasoning(ThinkingLevel::Off);
         assert_eq!(
             build_provider_additional_params(Some("cheaperinference"), None, &opts),
+            None,
+        );
+    }
+
+    #[test]
+    fn atmorouter_reasoning_maps_to_top_level_effort() {
+        for (level, expected) in [
+            (ThinkingLevel::Minimal, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::Max, "high"),
+        ] {
+            let opts = opts_with_reasoning(level);
+            let params = build_provider_additional_params(Some("atmorouter"), None, &opts)
+                .expect("AtmoRouter reasoning should produce request params");
+
+            assert_eq!(
+                params,
+                serde_json::json!({ "reasoning_effort": expected }),
+                "unexpected AtmoRouter request params for {level:?}",
+            );
+        }
+        let opts = opts_with_reasoning(ThinkingLevel::Off);
+        assert_eq!(
+            build_provider_additional_params(Some("atmorouter"), None, &opts),
             None,
         );
     }

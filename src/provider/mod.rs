@@ -375,6 +375,11 @@ pub(crate) enum AnyAgentInner {
             compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
+    AtmoRouter(
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
+        >,
+    ),
     Custom(
         openai::completion::CompletionModel<
             compressing_http::CompressingHttpClient<reqwest::Client>,
@@ -905,6 +910,7 @@ impl AnyAgent {
             AnyAgentInner::Requesty(_) => "requesty",
             AnyAgentInner::Opper(_) => "opper",
             AnyAgentInner::CheaperInference(_) => "cheaperinference",
+            AnyAgentInner::AtmoRouter(_) => "atmorouter",
             AnyAgentInner::Custom(_) => "custom",
         }
     }

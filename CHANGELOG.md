@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- AtmoRouter as a built-in provider. Set `ATMOROUTER_API_KEY` and select it
+  with `--provider atmorouter` (or a `providers.atmorouter` entry); defaults to
+  `cc/claude-sonnet-4-6` against `https://atmorouter.dev/v1`. Reasoning
+  effort goes out as a top-level `reasoning_effort` clamped to
+  `low`/`medium`/`high`. It is not part of key autodetection.
+
 ## [0.26.1] - 2026-10-29
 
 ### Fixed

@@ -19,7 +19,7 @@ use crate::extras::acp::config::AcpServerConfig;
 ///
 /// `provider_type` is optional: when the alias matches a built-in
 /// (anthropic, cerebras, deepseek, gemini, glm, kimi, ollama, openai, opencode,
-/// openrouter, requesty, opper, cheaperinference, or custom), it is inferred from the key. Set it only when aliasing
+/// openrouter, requesty, opper, cheaperinference, atmorouter, or custom), it is inferred from the key. Set it only when aliasing
 /// a built-in backend under a different name — e.g.
 /// `"ollama": { "provider_type": "openai", "base_url": "..." }`
 /// aliases the OpenAI-compatible backend under the alias `ollama`.
@@ -338,6 +338,7 @@ fn provider_type_supports_images(provider_type: Option<&str>) -> bool {
             | Some("requesty")
             | Some("opper")
             | Some("cheaperinference")
+            | Some("atmorouter")
     )
 }
 
@@ -2523,7 +2524,7 @@ pub fn load() -> Config {
                     "error: provider {:?} has invalid provider_type {:?}.\n\
                      Either the alias must match a built-in (openrouter, openai,\n\
                      openai-responses, anthropic, gemini, deepseek, glm, cerebras,\n\
-                     opencode, ollama, requesty, opper, cheaperinference, custom) or set `provider_type` explicitly\n\
+                     opencode, ollama, requesty, opper, cheaperinference, atmorouter, custom) or set `provider_type` explicitly\n\
                      to one of those.",
                     name, ptype,
                 );
@@ -3815,6 +3816,18 @@ mod provider_role_tests {
             .expect("bare Cheaper Inference built-in should resolve");
 
         assert_eq!(name, "cheaperinference");
+        assert!(entry.provider_type.is_none());
+        assert!(entry.model.is_none());
+    }
+
+    #[test]
+    fn atmorouter_bare_builtin_alias_resolves_without_provider_entry() {
+        let cfg = cfg_with_providers(r#"{ "provider": "atmorouter" }"#);
+        let (name, entry) = cfg
+            .resolve_role(ConfigRole::Default)
+            .expect("bare AtmoRouter built-in should resolve");
+
+        assert_eq!(name, "atmorouter");
         assert!(entry.provider_type.is_none());
         assert!(entry.model.is_none());
     }
