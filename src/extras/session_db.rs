@@ -60,6 +60,19 @@ fn note_degraded_open(msg: String) {
     }
 }
 
+/// A failing `journal_mode=WAL` only means "filesystem without WAL" when
+/// the failure is about persistence, not contention. A concurrent opener
+/// holding the fresh file yields SQLITE_BUSY/LOCKED — a local disk that
+/// is merely busy, not a network share — so it must not be reported as a
+/// degraded open (#392's concurrent-first-open race).
+fn wal_unsupported(err: &rusqlite::Error) -> bool {
+    !matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
+            | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
+    )
+}
+
 /// Serializes the tests that read or drain the process-wide open
 /// diagnostics. `take_degraded_opens` DRAINS, so without this two tests
 /// steal each other's notices and the failure is an assertion passing for
@@ -233,25 +246,27 @@ impl SessionDb {
         match conn.pragma_update(None, "journal_mode", "WAL") {
             Ok(_) => {}
             Err(e) => {
-                // WAL being unavailable is the signature of a filesystem
-                // that cannot do it — a network share, or a folder a sync
-                // client is rewriting underneath us. Those are also where
-                // SQLite files get corrupted (#769), so this is worth
-                // saying out loud rather than logging to a file nobody is
-                // capturing.
-                let msg = format!(
-                    "{} is on a filesystem without WAL support — falling back to the \
-                     DELETE journal ({e}). That usually means a network share or a sync \
-                     folder (Dropbox, iCloud, OneDrive), where SQLite databases can be \
-                     corrupted. Consider moving the project onto local disk.",
-                    path.display()
-                );
-                tracing::warn!(
-                    target: "dirge::session_db",
-                    path = %path.display(),
-                    "WAL mode unavailable — falling back to DELETE journal"
-                );
-                note_degraded_open(msg);
+                if wal_unsupported(&e) {
+                    // WAL being unavailable is the signature of a filesystem
+                    // that cannot do it — a network share, or a folder a sync
+                    // client is rewriting underneath us. Those are also where
+                    // SQLite files get corrupted (#769), so this is worth
+                    // saying out loud rather than logging to a file nobody is
+                    // capturing.
+                    let msg = format!(
+                        "{} is on a filesystem without WAL support — falling back to the \
+                         DELETE journal ({e}). That usually means a network share or a sync \
+                         folder (Dropbox, iCloud, OneDrive), where SQLite databases can be \
+                         corrupted. Consider moving the project onto local disk.",
+                        path.display()
+                    );
+                    tracing::warn!(
+                        target: "dirge::session_db",
+                        path = %path.display(),
+                        "WAL mode unavailable — falling back to DELETE journal"
+                    );
+                    note_degraded_open(msg);
+                }
                 conn.pragma_update(None, "journal_mode", "DELETE")
                     .map_err(|e| format!("Failed to set DELETE journal mode: {e}"))?;
             }

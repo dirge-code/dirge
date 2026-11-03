@@ -1792,6 +1792,34 @@ fn a_degraded_open_notice_survives_a_later_successful_open() {
     assert!(take_degraded_opens().is_empty());
 }
 
+/// The WAL pragma can fail for reasons that have nothing to do with the
+/// filesystem: a second opener holding the fresh file yields SQLITE_BUSY
+/// (#392's concurrent-first-open race hits this on local disk). A busy
+/// lock is not evidence of a network share, so it must NOT be reported
+/// as a degraded open — every concurrent open of a local DB would
+/// otherwise tell the user their disk is a sync folder.
+#[test]
+fn a_busy_wal_pragma_is_not_reported_as_a_degraded_open() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _drain = take_degraded_opens();
+    let (_db, _path) = temp_db();
+    // Simulate the race loser: journal_mode=WAL under a busy lock.
+    let busy = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some("database is locked".to_string()),
+    );
+    assert!(!wal_unsupported(&busy));
+    // The real fallback still fires for genuine WAL failures.
+    let io = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+        Some("disk I/O error".to_string()),
+    );
+    assert!(wal_unsupported(&io));
+    assert!(take_degraded_opens().is_empty());
+}
+
 /// A process opens more than one database — the per-project `state.db`
 /// and the global memory store — and they can sit on different
 /// filesystems. Each must be reported: keeping only the most recent
