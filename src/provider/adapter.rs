@@ -149,6 +149,12 @@ pub fn reasoning_profile(provider: Option<&str>, model: Option<&str>) -> Reasoni
             effort: EffortWire::TopLevelStandardEffort,
             disable: DisableWire::None,
         },
+        // Standard Compute is an OpenAI-compatible gateway whose chat/completions
+        // path reads the top-level `reasoning_effort`, the Requesty shape.
+        Some("standardcompute") => ReasoningProfile {
+            effort: EffortWire::TopLevelStandardEffort,
+            disable: DisableWire::None,
+        },
         Some("openai") => ReasoningProfile {
             effort: EffortWire::NestedEffort,
             disable: DisableWire::None,
@@ -597,6 +603,11 @@ mod tests {
             ),
             (
                 "cheaperinference",
+                EffortWire::TopLevelStandardEffort,
+                DisableWire::None,
+            ),
+            (
+                "standardcompute",
                 EffortWire::TopLevelStandardEffort,
                 DisableWire::None,
             ),
@@ -1234,6 +1245,32 @@ mod max_tokens_tests {
                 params,
                 serde_json::json!({ "reasoning_effort": expected }),
                 "unexpected Cheaper Inference params for {level:?}",
+            );
+            assert!(params.get("reasoning").is_none());
+        }
+
+        assert_eq!(profile.effort_params(ThinkingLevel::Off, None), None);
+        assert_eq!(profile.disable_params(), None);
+    }
+
+    #[test]
+    fn standard_compute_uses_standard_top_level_effort_without_disable_knob() {
+        let profile = reasoning_profile(Some("standardcompute"), None);
+        for (level, expected) in [
+            (ThinkingLevel::Minimal, "low"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Xhigh, "high"),
+            (ThinkingLevel::Max, "high"),
+        ] {
+            let params = profile
+                .effort_params(level, None)
+                .expect("enabled Standard Compute reasoning should produce params");
+            assert_eq!(
+                params,
+                serde_json::json!({ "reasoning_effort": expected }),
+                "unexpected Standard Compute params for {level:?}",
             );
             assert!(params.get("reasoning").is_none());
         }
