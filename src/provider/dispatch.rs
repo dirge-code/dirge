@@ -61,6 +61,9 @@ pub enum AnyClient {
     UberLlm(
         openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>,
     ),
+    StandardCompute(
+        openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>,
+    ),
     Custom(
         openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>,
     ),
@@ -100,6 +103,7 @@ impl AnyClient {
             AnyClient::Opper(c) => AnyModel::Opper(c.completion_model(name)),
             AnyClient::CheaperInference(c) => AnyModel::CheaperInference(c.completion_model(name)),
             AnyClient::UberLlm(c) => AnyModel::UberLlm(c.completion_model(name)),
+            AnyClient::StandardCompute(c) => AnyModel::StandardCompute(c.completion_model(name)),
             AnyClient::Custom(c) => AnyModel::Custom(c.completion_model(name)),
         }
     }
@@ -435,6 +439,11 @@ pub enum AnyModel {
             super::compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
+    StandardCompute(
+        openai::completion::CompletionModel<
+            super::compressing_http::CompressingHttpClient<reqwest::Client>,
+        >,
+    ),
     Custom(
         openai::completion::CompletionModel<
             super::compressing_http::CompressingHttpClient<reqwest::Client>,
@@ -501,6 +510,7 @@ impl AnyModel {
             AnyModel::Opper(m) => one_shot!(m),
             AnyModel::CheaperInference(m) => one_shot!(m),
             AnyModel::UberLlm(m) => one_shot!(m),
+            AnyModel::StandardCompute(m) => one_shot!(m),
             AnyModel::Custom(m) => one_shot!(m),
         }
     }
@@ -563,6 +573,7 @@ impl AnyModel {
             AnyModel::Opper(_) => "opper",
             AnyModel::CheaperInference(_) => "cheaperinference",
             AnyModel::UberLlm(_) => "uberllm",
+            AnyModel::StandardCompute(_) => "standardcompute",
             AnyModel::Custom(_) => "custom",
         }
     }
@@ -591,6 +602,7 @@ impl AnyModel {
             AnyModel::Opper(m) => m.model.clone(),
             AnyModel::CheaperInference(m) => m.model.clone(),
             AnyModel::UberLlm(m) => m.model.clone(),
+            AnyModel::StandardCompute(m) => m.model.clone(),
             AnyModel::Custom(m) => m.model.clone(),
         }
     }

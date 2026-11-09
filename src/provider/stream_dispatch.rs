@@ -30,6 +30,7 @@ macro_rules! dispatch_stream_fn {
         // configured aliases. OpenAI Responses needs canonical `openai` for
         // reasoning/tool-call ID conversion; Cerebras, Requesty, Opper, Cheaper
         // Inference and UberLLM need their
+        // Inference and Standard Compute need their
         // canonical names for the top-level reasoning_effort shape. These concrete dispatch arms
         // know the backend even when a role route was configured under an alias.
         // Other providers retain the passed identity until they need the same
@@ -146,6 +147,14 @@ macro_rules! dispatch_stream_fn {
                 $tools,
                 $timeout,
                 Some("uberllm".to_string()),
+                $model_name,
+                $filter,
+            ),
+            $enum::StandardCompute($bind) => __stream_fn(
+                $model,
+                $tools,
+                $timeout,
+                Some("standardcompute".to_string()),
                 $model_name,
                 $filter,
             ),
