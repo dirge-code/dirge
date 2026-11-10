@@ -373,6 +373,7 @@ where
                     chunk_timeout,
                     Some(opts.signal.clone()),
                     reasoning_budget,
+                    provider_requires_openai_call_ids(provider_name.as_deref()),
                 );
                 use futures::stream::StreamExt;
                 while let Some(evt) = wrapped.next().await {

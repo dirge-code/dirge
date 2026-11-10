@@ -62,6 +62,7 @@ pub fn wrap_rig_stream<R>(
     chunk_timeout: Option<std::time::Duration>,
     signal: Option<crate::agent::agent_loop::tool::AbortSignal>,
     reasoning_budget_tokens: usize,
+    prefer_call_id: bool,
 ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
 where
     R: Clone + Unpin + Send + GetTokenUsage + 'static,
@@ -71,6 +72,7 @@ where
         chunk_timeout,
         signal,
         reasoning_budget_tokens,
+        prefer_call_id,
     )
 }
 
@@ -115,7 +117,7 @@ where
     // point), so the cap falls back to the most permissive derived value —
     // never a guess that could be lower than what the turn was granted.
     let budget = super::thinking_budget::budget_for_turn(None, None);
-    wrap_streamed_assistant_with_budget(raw, chunk_timeout, signal, budget)
+    wrap_streamed_assistant_with_budget(raw, chunk_timeout, signal, budget, false)
 }
 
 /// [`wrap_streamed_assistant`] with an explicit per-turn reasoning cap.
@@ -131,6 +133,7 @@ pub fn wrap_streamed_assistant_with_budget<R>(
     chunk_timeout: Option<std::time::Duration>,
     signal: Option<crate::agent::agent_loop::tool::AbortSignal>,
     reasoning_budget_tokens: usize,
+    prefer_call_id: bool,
 ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
 where
     R: Clone + Unpin + Send + GetTokenUsage + 'static,
@@ -518,7 +521,12 @@ where
                     // freshly-pushed blocks emit Start + End
                     // as before.
                     let new_block = ContentBlock::ToolCall {
-                        id: tool_call.id.clone(),
+                        // Responses uses call_id to correlate calls with tool results.
+                        id: if prefer_call_id {
+                            tool_call.call_id.clone().unwrap_or_else(|| tool_call.id.clone())
+                        } else {
+                            tool_call.id.clone()
+                        },
                         name: tool_call.function.name.clone(),
                         arguments: tool_call.function.arguments.clone(),
                         // GH #833: rig hands us Gemini's `thought_signature`

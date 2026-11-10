@@ -58,6 +58,8 @@ pub mod prompt_leak;
 pub mod publish_guard;
 pub mod reflexion;
 pub mod residual;
+#[cfg(test)]
+mod responses_call_id_tests;
 pub mod result;
 pub mod retry;
 pub mod rig_stream;
