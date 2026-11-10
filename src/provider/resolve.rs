@@ -27,6 +27,7 @@ pub enum ProviderKind {
     Requesty,
     Opper,
     CheaperInference,
+    StandardCompute,
     Custom,
 }
 
@@ -50,6 +51,7 @@ pub fn default_model_for(provider_name: &str) -> &'static str {
         Some(ProviderKind::Requesty) => "openai/gpt-4o-mini",
         Some(ProviderKind::Opper) => "claude-sonnet-4-6",
         Some(ProviderKind::CheaperInference) => "gpt-5.4-mini",
+        Some(ProviderKind::StandardCompute) => "StandardCompute",
         // OpenRouter + Custom + unknown — keep the historical default
         // since OpenRouter wants the `vendor/model` form.
         _ => "deepseek/deepseek-v4-flash",
@@ -129,6 +131,7 @@ pub fn parse_provider(name: &str) -> Option<ProviderKind> {
         "requesty" => Some(ProviderKind::Requesty),
         "opper" => Some(ProviderKind::Opper),
         "cheaperinference" => Some(ProviderKind::CheaperInference),
+        "standardcompute" => Some(ProviderKind::StandardCompute),
         "custom" => Some(ProviderKind::Custom),
         _ => None,
     }
@@ -386,6 +389,7 @@ fn kind_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Requesty => "requesty",
         ProviderKind::Opper => "opper",
         ProviderKind::CheaperInference => "cheaperinference",
+        ProviderKind::StandardCompute => "standardcompute",
         ProviderKind::Custom => "custom",
     }
 }
@@ -549,6 +553,7 @@ const BUILTIN_PROVIDER_NAMES: &[&str] = &[
     "requesty",
     "opper",
     "cheaperinference",
+    "standardcompute",
     "custom",
 ];
 
@@ -699,6 +704,7 @@ fn provider_env_var(kind: ProviderKind) -> &'static str {
         ProviderKind::Requesty => "REQUESTY_API_KEY",
         ProviderKind::Opper => "OPPER_API_KEY",
         ProviderKind::CheaperInference => "CHEAPER_INFERENCE_API_KEY",
+        ProviderKind::StandardCompute => "STANDARDCOMPUTE_API_KEY",
         ProviderKind::Custom => "CUSTOM_API_KEY",
     }
 }
@@ -1058,6 +1064,37 @@ mod cheaper_inference_identity_tests {
                 .iter()
                 .all(|(_, provider)| *provider != "cheaperinference"),
             "Cheaper Inference must be selected explicitly",
+        );
+    }
+}
+
+#[cfg(test)]
+mod standard_compute_identity_tests {
+    use super::*;
+
+    #[test]
+    fn standard_compute_parses_case_insensitively_and_defaults_to_a_bare_model() {
+        for name in ["standardcompute", "STANDARDCOMPUTE", "StandardCompute"] {
+            assert_eq!(
+                parse_provider(name).map(kind_label),
+                Some("standardcompute"),
+                "provider name {name:?} should resolve canonically",
+            );
+        }
+        assert_eq!(default_model_for("standardcompute"), "StandardCompute");
+        assert_eq!(
+            provider_env_var(ProviderKind::StandardCompute),
+            "STANDARDCOMPUTE_API_KEY"
+        );
+    }
+
+    #[test]
+    fn standard_compute_is_not_autodetected() {
+        assert!(
+            PROVIDER_AUTODETECT_ORDER
+                .iter()
+                .all(|(_, provider)| *provider != "standardcompute"),
+            "Standard Compute must be selected explicitly",
         );
     }
 }

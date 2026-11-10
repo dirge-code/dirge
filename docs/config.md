@@ -73,7 +73,7 @@ Accepted top-level keys:
 
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, `cerebras`, `opencode`, `kimi`/`kimi-code`/`moonshot`, `requesty`, `opper`, `cheaperinference`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
+| `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, `cerebras`, `opencode`, `kimi`/`kimi-code`/`moonshot`, `requesty`, `opper`, `cheaperinference`, `standardcompute`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
 | `auth`                    | string  | Default authentication source for providers that don't set their own `providers.<name>.auth`: `api-key` (the implicit default), `chatgpt` (Codex/OpenAI login tokens), `anthropic` / `claude-code` (Anthropic Claude Code OAuth), or `kimi` (Kimi Code device OAuth). See [Providers and roles](#providers-and-roles). |
 | `providers`               | object  | Map of provider alias → entry. The active model lives in `providers.<active-provider>.model`. Each role key below points at one of these aliases. See [Providers and roles](#providers-and-roles). |
 | `review_provider`         | string  | Provider alias for the background session-review pass. Falls back to `provider`. |
@@ -381,7 +381,7 @@ Each `providers` entry accepts:
 
 | Field | Description |
 |-------|-------------|
-| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `kimi`, `requesty`, `opper`, `cheaperinference`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
+| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `kimi`, `requesty`, `opper`, `cheaperinference`, `standardcompute`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
 | `base_url` | Endpoint base URL (for custom / self-hosted endpoints). |
 | `model` | Model name for this provider. |
 | `api_key` | Literal key or `${ENV_VAR}` interpolation. Takes precedence over `api_key_env`. |
@@ -633,6 +633,45 @@ another model, add only the model override and keep the secret in
 Requests go to `https://api.cheaperinference.com/v1`. Set
 `providers.cheaperinference.base_url` to point somewhere else; Dirge does not
 read a separate `CHEAPER_INFERENCE_BASE_URL` variable.
+
+Reasoning effort is sent as a top-level `reasoning_effort` (`low`, `medium`, or
+`high`), with lower and higher Dirge levels clamped to that set and the field
+omitted when reasoning is off.
+
+### Standard Compute
+
+[Standard Compute](https://standardcompute.com) is an OpenAI-compatible
+gateway. One API key reaches open and frontier models. The default model,
+`StandardCompute`, is routed: each request goes to the cheapest enabled model
+that can handle it, with automatic fallback. Pinned model ids use the
+`vendor/model` form listed by `GET https://api.stdcmpt.com/v1/models`. It needs
+no `providers` entry. Create a key at <https://standardcompute.com>, export it
+and select the built-in:
+
+```bash
+export STANDARDCOMPUTE_API_KEY="..."
+dirge --provider standardcompute  # defaults to StandardCompute
+```
+
+Standard Compute is never picked by key autodetection; select it with
+`--provider standardcompute` or `"provider": "standardcompute"`. To pin a
+model, add only the model override and keep the secret in
+`STANDARDCOMPUTE_API_KEY`:
+
+```json
+{
+  "provider": "standardcompute",
+  "providers": {
+    "standardcompute": {
+      "model": "deepseek/deepseek-v4-pro"
+    }
+  }
+}
+```
+
+Requests go to `https://api.stdcmpt.com/v1`. Set
+`providers.standardcompute.base_url` to point somewhere else; Dirge does not
+read a separate `STANDARDCOMPUTE_BASE_URL` variable.
 
 Reasoning effort is sent as a top-level `reasoning_effort` (`low`, `medium`, or
 `high`), with lower and higher Dirge levels clamped to that set and the field
