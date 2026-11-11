@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- UberLLM as a built-in provider. Set `UBERLLM_API_KEY` and select it with
+  `--provider uberllm` (or a `providers.uberllm` entry); defaults to
+  `deepseek/deepseek-v4-flash` against `https://api.uberllm.dev/v1`. Reasoning
+  effort goes out as a top-level `reasoning_effort` clamped to
+  `low`/`medium`/`high`. It is not part of key autodetection.
+
 ## [0.26.1] - 2026-10-29
 
 ### Fixed
