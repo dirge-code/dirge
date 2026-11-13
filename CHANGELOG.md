@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- Bumped rusqlite to 0.41.1 and rmcp to 3.10.0 to resolve
+  RUSTSEC-2026-0459, RUSTSEC-2026-0457, RUSTSEC-2026-0461, and
+  RUSTSEC-2026-0462.
+
 ## [0.26.1] - 2026-10-29
 
 ### Fixed
