@@ -11,6 +11,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   RUSTSEC-2026-0459, RUSTSEC-2026-0457, RUSTSEC-2026-0461, and
   RUSTSEC-2026-0462.
 
+### Added
+- Interactive sessions now report `idle`, `working`, `blocked`, and `done`
+  lifecycle states through OSC 7501 with `app=dirge`, so compatible terminal
+  managers such as Herdr can track agent activity and approval prompts.
+
 ## [0.26.1] - 2026-10-29
 
 ### Fixed
