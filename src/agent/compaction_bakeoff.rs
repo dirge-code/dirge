@@ -77,7 +77,14 @@ pub(crate) fn bakeoff_summarizer() -> Option<(SummarizeFn, String)> {
     let model = client.completion_model(model_name.clone());
     let sfn: SummarizeFn = std::sync::Arc::new(move |prompt: String| {
         let m = model.clone();
-        Box::pin(async move { crate::provider::summarize::summarize_with_model(m, prompt).await })
+        Box::pin(async move {
+            crate::provider::summarize::summarize_with_model(
+                m,
+                prompt,
+                crate::timeout::Timeouts::DEFAULT.stream_chunk,
+            )
+            .await
+        })
     });
     Some((sfn, format!("{provider}/{model_name}")))
 }

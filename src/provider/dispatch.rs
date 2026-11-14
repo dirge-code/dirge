@@ -140,8 +140,12 @@ pub(crate) fn build_compaction_prompt(
 /// event loop runs it on a spawned task so the UI stays responsive. A stray
 /// delimiter in the output would corrupt the next turn's system prompt (where
 /// the summary is injected), so strip before returning.
-pub(crate) async fn run_compaction(model: AnyModel, prompt_text: String) -> anyhow::Result<String> {
-    let response = summarize::summarize_with_model(model, prompt_text).await?;
+pub(crate) async fn run_compaction(
+    model: AnyModel,
+    prompt_text: String,
+    chunk_timeout: std::time::Duration,
+) -> anyhow::Result<String> {
+    let response = summarize::summarize_with_model(model, prompt_text, chunk_timeout).await?;
     Ok(prompt::strip_compaction_delimiters(&response))
 }
 

@@ -1644,7 +1644,14 @@ async fn main() -> anyhow::Result<()> {
     if cfg.approval_provider.is_some() {
         match cfg.resolve_role(config::ConfigRole::Approval) {
             Some((alias, entry)) => {
-                match provider::build_approval_fn(&alias, &entry, &cfg.providers_map(), cfg.auth) {
+                let chunk_timeout = cfg.resolve_stream_chunk_timeout(&alias);
+                match provider::build_approval_fn(
+                    &alias,
+                    &entry,
+                    &cfg.providers_map(),
+                    cfg.auth,
+                    chunk_timeout,
+                ) {
                     Ok(f) => {
                         if let Some(perm) = &permission {
                             perm.lock_ignore_poison().set_approval_fn(f);
