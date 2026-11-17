@@ -52,7 +52,7 @@ pub(crate) struct KimiHttpClient {
 impl Default for KimiHttpClient {
     fn default() -> Self {
         Self {
-            inner: reqwest::Client::new(),
+            inner: super::client::reqwest_no_timeout(),
             token: None,
             identity_headers: Arc::new(http::HeaderMap::new()),
         }
@@ -122,7 +122,7 @@ impl KimiHttpClient {
         identity_headers: http::HeaderMap,
     ) -> Self {
         Self {
-            inner: reqwest::Client::new(),
+            inner: super::client::reqwest_no_timeout(),
             token: bearer_token.map(|bearer| {
                 Arc::new(RefreshableToken::renewable(
                     bearer,

@@ -43,7 +43,7 @@ impl CodexHttpClient {
         refresher: CodexRefreshFn,
     ) -> Self {
         Self {
-            inner: reqwest::Client::new(),
+            inner: super::client::reqwest_no_timeout(),
             token: Some(Arc::new(RefreshableToken::renewable(
                 bearer_token,
                 expires_at_ms,
