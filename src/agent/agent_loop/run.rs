@@ -1492,10 +1492,32 @@ type CheckpointSlot = std::sync::Arc<std::sync::Mutex<Option<CachedCheckpoint>>>
 /// eventually latches.
 const COMPACTION_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Resolved compaction summarizer timeout. Uses the process-wide stream-chunk
+/// timeout when the user has configured one; otherwise keeps the 120 s constant.
+fn compaction_summary_timeout() -> std::time::Duration {
+    let resolved = crate::timeout::Timeouts::get().stream_chunk;
+    if resolved == crate::timeout::Timeouts::DEFAULT.stream_chunk {
+        COMPACTION_SUMMARY_TIMEOUT
+    } else {
+        resolved
+    }
+}
+
 /// Wall-clock ceiling on a background checkpoint summarizer call. The
 /// checkpoint is detached so it never blocks the loop, but a hung provider
 /// would otherwise leak the task forever; bound it so it gives up.
 const CHECKPOINT_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Resolved checkpoint summarizer timeout. Uses the process-wide stream-chunk
+/// timeout when the user has configured one; otherwise keeps the 120 s constant.
+fn checkpoint_summary_timeout() -> std::time::Duration {
+    let resolved = crate::timeout::Timeouts::get().stream_chunk;
+    if resolved == crate::timeout::Timeouts::DEFAULT.stream_chunk {
+        CHECKPOINT_SUMMARY_TIMEOUT
+    } else {
+        resolved
+    }
+}
 
 /// Spawn a background incremental checkpoint: summarize a snapshot of the
 /// current context off the loop, store it in `slot` for the next fold to
@@ -1543,7 +1565,7 @@ fn spawn_incremental_checkpoint(
             );
             return;
         };
-        let result = tokio::time::timeout(CHECKPOINT_SUMMARY_TIMEOUT, sfn(prompt)).await;
+        let result = tokio::time::timeout(checkpoint_summary_timeout(), sfn(prompt)).await;
         // dirge-tgb9: strip echoed delimiters before this summary can be
         // spliced into context — same reason as the inline path below.
         let result =
@@ -1810,11 +1832,11 @@ async fn run_compaction_pass_with_focus(
                         // Bound the inline call: a provider that stalls without
                         // erroring would otherwise freeze the loop indefinitely.
                         // On timeout, keep the pruned context (Failed outcome).
-                        match tokio::time::timeout(COMPACTION_SUMMARY_TIMEOUT, sfn(prompt)).await {
+                        match tokio::time::timeout(compaction_summary_timeout(), sfn(prompt)).await {
                             Ok(r) => r,
                             Err(_) => Err(anyhow::anyhow!(
                                 "compaction summarizer timed out after {}s",
-                                COMPACTION_SUMMARY_TIMEOUT.as_secs()
+                                compaction_summary_timeout().as_secs()
                             )),
                         }
                     }

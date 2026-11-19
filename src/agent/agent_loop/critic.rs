@@ -55,6 +55,17 @@ pub(crate) fn truncate_rules<'a>(rules: &'a str, max: usize, note: &str) -> Cow<
 /// (dirge-ax46).
 pub(crate) const JUDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Resolved judge timeout. Uses the process-wide stream-chunk timeout when
+/// the user has configured one; otherwise keeps the historical 120 s constant.
+pub(crate) fn judge_timeout() -> std::time::Duration {
+    let resolved = crate::timeout::Timeouts::get().stream_chunk;
+    if resolved == crate::timeout::Timeouts::DEFAULT.stream_chunk {
+        JUDGE_TIMEOUT
+    } else {
+        resolved
+    }
+}
+
 /// Run a judge-style completion, failing open on error. Centralizes the
 /// `Ok(r) => r, Err(e) => { warn + return default }` shape shared by the
 /// critic, goal-gate, and code-review passes. `target` must be a string
@@ -63,7 +74,7 @@ pub(crate) const JUDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 macro_rules! run_judge {
     ($judge:expr, $prompt:expr, $target:literal, $msg:literal, $default:expr) => {
         match ::tokio::time::timeout(
-            $crate::agent::agent_loop::critic::JUDGE_TIMEOUT,
+            $crate::agent::agent_loop::critic::judge_timeout(),
             $judge($prompt),
         )
         .await
@@ -76,7 +87,7 @@ macro_rules! run_judge {
             Err(_) => {
                 tracing::warn!(
                     target: $target,
-                    timeout_secs = $crate::agent::agent_loop::critic::JUDGE_TIMEOUT.as_secs(),
+                    timeout_secs = $crate::agent::agent_loop::critic::judge_timeout().as_secs(),
                     "judge call timed out; failing open"
                 );
                 return $default;
