@@ -356,7 +356,7 @@ tree-sitter-c = { version = "0.24", optional = true }
 tree-sitter-cpp = { version = "0.23", optional = true }
 streaming-iterator = { version = "0.1", optional = true }
 janetrs = { version = "0.8", optional = true }
-evil-janet = { version = "=1.37.2", optional = true }
+evil-janet = { version = "=1.41.3", optional = true }
 html2text = "0.17"
 indexmap = "2"
 # Windows-safe canonicalize: returns non-verbatim paths (no `\\?\` prefix)
@@ -477,5 +477,14 @@ debug = 0
 #     already been unwound off the run stack and removed from active_tasks, so
 #     without a root the GC collects it (and its env table) before
 #     janet_dyn("err-color") reads janet_vm.fiber->env.
+# Neither fix is upstream as of 1.41.3, so the vendored tree must keep carrying
+# them across bumps. The dependency is pinned to an exact version that equals
+# the vendored crate's: the pin is what the published crate resolves with
+# (the [patch] is stripped on `cargo publish`), so the exact version must be
+# one that builds on current toolchains — 1.37.2 needs bindgen 0.70, which
+# emits opaque one-field structs against libclang 23 (#882), and that broke
+# the 0.27.0 crates.io publish. Raising the pin therefore means rebasing
+# vendor/evil-janet onto the new release, or the patch silently stops
+# applying and the two fixes above are lost from every binary build.
 [patch.crates-io]
 evil-janet = { path = "vendor/evil-janet" }

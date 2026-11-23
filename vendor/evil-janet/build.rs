@@ -8,10 +8,10 @@ fn main() {
     compile_error!(r#"You can only use either "link-amalg" or "system" feature, not both."#);
 
     // Link to the system libjanet if the system feature is included
-    #[cfg(feature = "link-system")]
+    #[cfg(any(feature = "system", feature = "link-system"))]
     println!("cargo:rustc-link-lib=janet");
 
-    // Make cargo rerun if header or the amalgamated source changes
+    // Make cargo rerun if header changes
     println!("cargo:rerun-if-changed=csrc/janet.h");
     println!("cargo:rerun-if-changed=csrc/janet.c");
 
@@ -35,11 +35,8 @@ fn main() {
         .allowlist_function(allowlist_regex)
         .allowlist_var(allowlist_regex)
         .override_abi(bindgen::Abi::CUnwind, allowlist_regex)
-        .rust_target(bindgen::RustTarget::stable(71,0).expect("valid rust target"))
+        .rust_target(bindgen::RustTarget::stable(77, 0).expect("Missing rust target"))
         .formatter(bindgen::Formatter::Rustfmt);
-
-    #[cfg(windows)]
-    let bindings = bindings.clang_args(&["--target=x86_64-pc-windows-gnu"]);
 
     let bindings = bindings.generate().expect("Unable to generate bindings");
 

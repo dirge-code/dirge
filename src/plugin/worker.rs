@@ -4534,6 +4534,45 @@ mod tests {
         assert_eq!(w.eval("(+ 1 1)").unwrap(), "2");
     }
 
+    /// Janet >= 1.41 delivers the `os/execute` `:x` failure through
+    /// `janet_cancel`, which refuses a fiber the event loop did not flag
+    /// as a task (it panics "cannot cancel non-task fiber" instead).
+    /// `janet_dobytes` starts this eval's top-level fiber directly, so the
+    /// panic fires inside the loop callback, the error is dropped, and the
+    /// worker never replies.
+    #[test]
+    fn a_failing_x_execute_on_the_plugin_vm_reports_the_error() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let r = w
+            .eval_with_timeout(
+                r#"(os/execute ["/bin/sh" "-c" "exit 9"] :x)"#,
+                Duration::from_secs(10),
+            )
+            .expect_err(":x on exit 9 must raise");
+        assert!(r.contains("9"), "unexpected error text: {r}");
+        assert_eq!(w.eval("(+ 1 2)").unwrap(), "3");
+    }
+
+    /// The same, on the agent-facing notebook: the cell reports `ok=false`
+    /// and keeps what the child printed before failing.
+    #[test]
+    fn a_failing_x_execute_in_a_notebook_cell_reports_the_error() {
+        let mut w = Worker::try_spawn_notebook().expect("spawn notebook");
+        let cell = w
+            .eval_cell(
+                r#"(os/execute ["/bin/sh" "-c" "printf 'before-fail\n'; exit 9"] :px)"#,
+                Some("x-flag"),
+                4096,
+                Duration::from_secs(10),
+            )
+            .expect("the worker must reply");
+        assert!(!cell.ok, "a :x non-zero exit should raise: {cell:?}");
+        assert!(
+            cell.output.contains("before-fail"),
+            "output lost when the command failed: {cell:?}"
+        );
+    }
+
     /// dirge-9xjg.3: a cell's `(print …)` has to come back, or the
     /// notebook is unusable — printing intermediate values is how notebook
     /// work is done.
