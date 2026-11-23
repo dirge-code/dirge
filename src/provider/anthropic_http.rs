@@ -55,7 +55,7 @@ impl AnthropicHttpClient {
     /// token is never renewed (no expiry, no refresher).
     pub(crate) fn new(bearer_token: String) -> Self {
         Self {
-            inner: reqwest::Client::new(),
+            inner: super::client::reqwest_no_timeout(),
             token: Some(Arc::new(RefreshableToken::fixed(bearer_token))),
         }
     }
@@ -69,7 +69,7 @@ impl AnthropicHttpClient {
         refresher: RefreshFn,
     ) -> Self {
         Self {
-            inner: reqwest::Client::new(),
+            inner: super::client::reqwest_no_timeout(),
             token: Some(Arc::new(RefreshableToken::renewable(
                 bearer_token,
                 expires_at_ms,

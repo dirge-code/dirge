@@ -2155,7 +2155,13 @@ impl Config {
             o.map(std::time::Duration::from_secs).unwrap_or(default)
         };
         crate::timeout::Timeouts {
-            stream_chunk: or_default(c.stream_chunk_secs, d.stream_chunk),
+            // `[timeouts].stream_chunk_secs` wins, then the top-level
+            // `stream_chunk_timeout_secs`, so this agrees with
+            // `resolve_stream_chunk_timeout` for the no-provider case.
+            stream_chunk: or_default(
+                c.stream_chunk_secs.or(self.stream_chunk_timeout_secs),
+                d.stream_chunk,
+            ),
             request_establish: or_default(c.request_establish_secs, d.request_establish),
             tool_call_gap: or_default(c.tool_call_gap_secs, d.tool_call_gap),
             tool_call: or_default(c.tool_call_secs, d.tool_call),
@@ -3724,6 +3730,37 @@ mod provider_role_tests {
 
     fn cfg_with_providers(json: &str) -> Config {
         serde_json::from_str(json).expect("parses")
+    }
+
+    #[test]
+    fn top_level_stream_chunk_timeout_feeds_resolve_timeouts() {
+        // `resolve_stream_chunk_timeout` honours the top-level key, but the
+        // agent loop's judge / compaction / post-session helpers read the
+        // process-wide `Timeouts::get().stream_chunk`, which comes from
+        // `resolve_timeouts`. Both must agree or a user who sets only the
+        // top-level key gets 86400s on the stream and 120s on the judges.
+        let cfg = cfg_with_providers(r#"{"stream_chunk_timeout_secs": 86400}"#);
+        assert_eq!(
+            cfg.resolve_timeouts().stream_chunk,
+            std::time::Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            cfg.resolve_stream_chunk_timeout("any"),
+            cfg.resolve_timeouts().stream_chunk
+        );
+    }
+
+    #[test]
+    fn timeouts_table_still_overrides_top_level_for_resolve_timeouts() {
+        // The `[timeouts]` table is the finer-grained knob; it keeps winning
+        // inside `resolve_timeouts` so existing configs are unaffected.
+        let cfg = cfg_with_providers(
+            r#"{"stream_chunk_timeout_secs": 86400, "timeouts": {"stream_chunk_secs": 900}}"#,
+        );
+        assert_eq!(
+            cfg.resolve_timeouts().stream_chunk,
+            std::time::Duration::from_secs(900)
+        );
     }
 
     #[test]

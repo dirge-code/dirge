@@ -426,8 +426,12 @@ pub async fn build_agent(
     // model. Either way adapts `summarize_with_model` (AnyModel + prompt →
     // summary) to the `SummarizeFn` shape.
     {
-        let summarize_fn =
-            build_summarize_fn_for_session(cfg, parent_model.clone(), session_id.as_deref());
+        let summarize_fn = build_summarize_fn_for_session(
+            cfg,
+            parent_model.clone(),
+            session_id.as_deref(),
+            chunk_timeout,
+        );
         agent = agent.with_summarizer(summarize_fn);
     }
 
@@ -464,6 +468,7 @@ pub async fn build_agent(
                         "escalation provider equals default; skipping duplicate client construction",
                     );
                 } else {
+                    let chunk_timeout = cfg.resolve_stream_chunk_timeout(&escalation_alias);
                     match build_escalation_stream_fn(
                         &escalation_alias,
                         &escalation_entry,
@@ -560,6 +565,7 @@ pub async fn build_agent(
                     Ok(raw_client) => {
                         let client = std::sync::Arc::new(raw_client);
                         let model_name = resolve_entry_model_name(&client, &alias, &entry);
+                        let chunk_timeout = cfg.resolve_stream_chunk_timeout(&alias);
                         // Goal gate: always wired (fires only with --goal),
                         // judged under its OWN fixed preamble — decoupled
                         // from any critic override.
@@ -568,6 +574,7 @@ pub async fn build_agent(
                             model_name.clone(),
                             "critic",
                             std::sync::Arc::from(crate::agent::agent_loop::goal::GOAL_PREAMBLE),
+                            chunk_timeout,
                         ));
                         // Critic: wired unless the active prompt disables it.
                         if !critic_disabled {
@@ -594,6 +601,7 @@ pub async fn build_agent(
                                 model_name.clone(),
                                 "critic",
                                 judge_preamble,
+                                chunk_timeout,
                             ));
                             // dirge-5mtx.3b: closed-answer-set judge, same
                             // client and model. Armed whenever the critic is,
@@ -603,6 +611,7 @@ pub async fn build_agent(
                             agent = agent.with_classify_fn(build_classify_fn(
                                 client.clone(),
                                 model_name.clone(),
+                                chunk_timeout,
                             ));
                             // The standalone code-review judge stays armed only
                             // for the manual `/review` command (which runs the
@@ -617,6 +626,7 @@ pub async fn build_agent(
                                     std::sync::Arc::from(
                                         crate::agent::agent_loop::code_review::REVIEW_PREAMBLE,
                                     ),
+                                    chunk_timeout,
                                 ));
                                 agent = agent.with_code_review_mode(code_review_mode);
                             }
@@ -721,6 +731,7 @@ pub async fn build_agent(
                         "review provider equals default; skipping duplicate client construction",
                     );
                 } else {
+                    let chunk_timeout = cfg.resolve_stream_chunk_timeout(&review_alias);
                     match build_review_stream_fn(
                         &review_alias,
                         &review_entry,
@@ -912,6 +923,7 @@ fn build_escalation_stream_fn(
 fn build_classify_fn(
     client: std::sync::Arc<AnyClient>,
     model_name: String,
+    chunk_timeout: std::time::Duration,
 ) -> crate::agent::agent_loop::critic::ClassifyFn {
     std::sync::Arc::new(move |question: String, options: &'static [&'static str]| {
         let client = client.clone();
@@ -923,14 +935,26 @@ fn build_classify_fn(
             let preamble: std::sync::Arc<str> = std::sync::Arc::from(CLASSIFY_PREAMBLE);
             let model = client.completion_model(model_name);
             let prompt = classify_prompt(&question, options);
-            let raw =
-                summarize::oneshot_with_model(model.clone(), "classify", &preamble, prompt).await?;
+            let raw = summarize::oneshot_with_model(
+                model.clone(),
+                "classify",
+                &preamble,
+                prompt,
+                chunk_timeout,
+            )
+            .await?;
             if let Some(idx) = parse_choice(&raw, options) {
                 return Ok(idx);
             }
             let retry = classify_retry_prompt(options);
-            let raw2 =
-                summarize::oneshot_with_model(model, "classify-retry", &preamble, retry).await?;
+            let raw2 = summarize::oneshot_with_model(
+                model,
+                "classify-retry",
+                &preamble,
+                retry,
+                chunk_timeout,
+            )
+            .await?;
             parse_choice(&raw2, options)
                 .ok_or_else(|| anyhow::anyhow!("classifier did not choose one of {options:?}"))
         })
@@ -943,6 +967,7 @@ fn build_judge_fn(
     model_name: String,
     label: &'static str,
     preamble: std::sync::Arc<str>,
+    chunk_timeout: std::time::Duration,
 ) -> crate::agent::agent_loop::critic::CriticFn {
     std::sync::Arc::new(move |prompt: String| {
         let client = client.clone();
@@ -950,7 +975,7 @@ fn build_judge_fn(
         let preamble = preamble.clone();
         Box::pin(async move {
             let model = client.completion_model(model_name);
-            summarize::oneshot_with_model(model, label, &preamble, prompt).await
+            summarize::oneshot_with_model(model, label, &preamble, prompt, chunk_timeout).await
         })
             as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>
     })
@@ -1055,18 +1080,24 @@ pub(crate) fn build_summarize_fn(
     cfg: &Config,
     main_model: AnyModel,
 ) -> crate::agent::compression::SummarizeFn {
-    build_summarize_fn_for_session(cfg, main_model, None)
+    build_summarize_fn_for_session(
+        cfg,
+        main_model,
+        None,
+        crate::timeout::Timeouts::DEFAULT.stream_chunk,
+    )
 }
 
 pub(crate) fn build_summarize_fn_for_session(
     cfg: &Config,
     main_model: AnyModel,
     session_id: Option<&str>,
+    chunk_timeout: std::time::Duration,
 ) -> crate::agent::compression::SummarizeFn {
     let from_model = |model: AnyModel| -> crate::agent::compression::SummarizeFn {
         std::sync::Arc::new(move |prompt: String| {
             let m = model.clone();
-            Box::pin(async move { summarize::summarize_with_model(m, prompt).await })
+            Box::pin(async move { summarize::summarize_with_model(m, prompt, chunk_timeout).await })
         })
     };
 
@@ -1213,6 +1244,7 @@ pub fn build_approval_fn(
     entry: &ProviderEntry,
     providers: &HashMap<String, ProviderEntry>,
     default_auth: Option<ProviderAuth>,
+    chunk_timeout: std::time::Duration,
 ) -> anyhow::Result<crate::permission::approval::ApprovalFn> {
     use crate::permission::approval::{
         ApprovalDecision, ApprovalRequest, EVALUATOR_PREAMBLE, build_evaluator_prompt,
@@ -1226,8 +1258,14 @@ pub fn build_approval_fn(
         Box::pin(async move {
             let model = client.completion_model(model_name);
             let prompt = build_evaluator_prompt(&req);
-            let raw = summarize::oneshot_with_model(model, "approval", EVALUATOR_PREAMBLE, prompt)
-                .await?;
+            let raw = summarize::oneshot_with_model(
+                model,
+                "approval",
+                EVALUATOR_PREAMBLE,
+                prompt,
+                chunk_timeout,
+            )
+            .await?;
             Ok::<ApprovalDecision, anyhow::Error>(parse_decision(&raw))
         })
             as std::pin::Pin<

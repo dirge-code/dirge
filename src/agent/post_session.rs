@@ -94,6 +94,12 @@ impl Drop for InFlightGuard {
 /// the closure is harmless here.
 const STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Resolved per-stage timeout. Uses the process-wide stream-chunk timeout
+/// when the user has configured one; otherwise keeps the 300 s constant.
+fn stage_timeout() -> Duration {
+    crate::timeout::Timeouts::global_llm_deadline(STAGE_TIMEOUT)
+}
+
 /// A named post-session stage: a future that runs one learning
 /// pass to completion. The future owns its own error handling
 /// and reporting (returns `()`); the orchestrator only sequences
@@ -171,7 +177,7 @@ pub fn spawn_post_session(
                 )),
             ),
         ];
-        run_stages_sequentially(stages, STAGE_TIMEOUT).await;
+        run_stages_sequentially(stages, stage_timeout()).await;
         // Round 2: the review + curator passes may have written or
         // consolidated memories. Flag it so the running loop re-injects the
         // refreshed memory block at its next turn boundary — the agent's

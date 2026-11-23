@@ -191,6 +191,29 @@ impl Timeouts {
     pub fn get() -> Timeouts {
         RESOLVED.get().copied().unwrap_or(Self::DEFAULT)
     }
+
+    /// Resolve one of the fixed internal LLM deadlines (judge, compaction
+    /// summary, checkpoint, post-session stage) against the user's
+    /// stream-chunk budget.
+    ///
+    /// The stream-chunk timeout is the user's single "how long may the
+    /// model stall" knob, so a configured value applies to the oneshot
+    /// side calls too. At the default (300s) the historical per-site
+    /// constant wins because it is the tighter bound and keeps default
+    /// behaviour unchanged.
+    pub fn llm_deadline(&self, default: Duration) -> Duration {
+        if self.stream_chunk == Self::DEFAULT.stream_chunk {
+            default
+        } else {
+            self.stream_chunk
+        }
+    }
+
+    /// [`Self::llm_deadline`](Self::llm_deadline) against the process-wide
+    /// resolved timeouts — the form the agent loop uses.
+    pub fn global_llm_deadline(default: Duration) -> Duration {
+        Self::get().llm_deadline(default)
+    }
 }
 
 /// Process-wide resolved timeouts, installed once at startup by
@@ -240,6 +263,27 @@ mod tests {
     #[test]
     fn fresh_budget_is_not_expired() {
         assert!(!Deadline::start(Duration::from_secs(60)).is_expired());
+    }
+
+    #[test]
+    fn llm_deadline_keeps_site_default_at_default_chunk_timeout() {
+        let t = Timeouts::DEFAULT;
+        assert_eq!(
+            t.llm_deadline(Duration::from_secs(120)),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn llm_deadline_uses_configured_chunk_timeout() {
+        let t = Timeouts {
+            stream_chunk: Duration::from_secs(86_400),
+            ..Timeouts::DEFAULT
+        };
+        assert_eq!(
+            t.llm_deadline(Duration::from_secs(120)),
+            Duration::from_secs(86_400)
+        );
     }
 
     #[test]

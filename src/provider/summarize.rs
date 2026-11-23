@@ -28,12 +28,14 @@ use rig::streaming::StreamingChat;
 pub(crate) async fn summarize_with_model(
     model: super::AnyModel,
     prompt: String,
+    chunk_timeout: std::time::Duration,
 ) -> anyhow::Result<String> {
     oneshot_with_model(
         model,
         "summarizer",
         "You are a conversation summarizer.",
         prompt,
+        chunk_timeout,
     )
     .await
 }
@@ -49,6 +51,7 @@ pub(crate) async fn oneshot_with_model(
     label: &'static str,
     preamble: &str,
     prompt: String,
+    chunk_timeout: std::time::Duration,
 ) -> anyhow::Result<String> {
     let prompt = budgeted::BudgetedPrompt::new(label, &model.name(), prompt);
     // dirge-wire: opt-in dump so a mystery side-LLM call (which prompt, which
@@ -64,27 +67,57 @@ pub(crate) async fn oneshot_with_model(
     // `reasoning_disable_for_kind`). Computed before the consuming match.
     let disable = reasoning_disable_for_kind(model.provider_name(), Some(model.name().as_str()));
     match model {
-        super::AnyModel::OpenRouter(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::OpenAI(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::ChatGptOpenAI(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::OpenAICodex(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::Anthropic(m) => run_oneshot(m, label, preamble, prompt, disable).await,
+        super::AnyModel::OpenRouter(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::OpenAI(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::ChatGptOpenAI(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::OpenAICodex(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::Anthropic(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
         super::AnyModel::AnthropicOauth(m) => {
-            run_oneshot(m, label, preamble, prompt, disable).await
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
         }
-        super::AnyModel::Gemini(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::DeepSeek(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::Glm(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::Cerebras(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::OpenCode(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::Kimi(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::Ollama(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::Requesty(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-        super::AnyModel::Opper(m) => run_oneshot(m, label, preamble, prompt, disable).await,
+        super::AnyModel::Gemini(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::DeepSeek(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::Glm(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::Cerebras(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::OpenCode(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::Kimi(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::Ollama(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::Requesty(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
+        super::AnyModel::Opper(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
         super::AnyModel::CheaperInference(m) => {
-            run_oneshot(m, label, preamble, prompt, disable).await
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
         }
-        super::AnyModel::Custom(m) => run_oneshot(m, label, preamble, prompt, disable).await,
+        super::AnyModel::Custom(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
     }
 }
 
@@ -228,6 +261,7 @@ async fn run_oneshot<M>(
     preamble: &str,
     prompt: budgeted::BudgetedPrompt,
     reasoning_disable: Option<serde_json::Value>,
+    chunk_timeout: std::time::Duration,
 ) -> anyhow::Result<String>
 where
     M: rig::completion::CompletionModel + Clone + 'static,
@@ -269,16 +303,21 @@ where
 
             let mut response = String::new();
             use futures::StreamExt;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
+            loop {
+                match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                    Ok(Some(Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                         rig::streaming::StreamedAssistantContent::Text(text),
-                    )) => response.push_str(&text.text),
-                    Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)) => {
+                    )))) => response.push_str(&text.text),
+                    Ok(Some(Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)))) => {
                         return Ok(res.output.clone());
                     }
-                    Err(e) => return Err(e.to_string()),
-                    _ => {}
+                    Ok(Some(Err(e))) => return Err(e.to_string()),
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        let secs = chunk_timeout.as_secs();
+                        return Err(format!("stream chunk timed out after {secs}s (provider stalled or connection dropped)"));
+                    }
                 }
             }
             Ok(response)
@@ -478,5 +517,78 @@ mod tests {
         assert!(out.starts_with("line 0\n"));
         assert!(out.contains("truncated by summarizer-prompt budget"));
         assert!(out.ends_with("line 1999\n"));
+    }
+
+    #[test]
+    fn critic_role_alias_resolution_drives_oneshot_timeout() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            crate::config::ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                model: Some("m".to_string()),
+                allow_insecure: true,
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "r".to_string(),
+            crate::config::ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                model: Some("m".to_string()),
+                allow_insecure: true,
+                stream_chunk_timeout_secs: Some(42),
+                ..Default::default()
+            },
+        );
+        let mut cfg = crate::config::Config {
+            providers: Some(providers),
+            stream_chunk_timeout_secs: Some(7),
+            ..Default::default()
+        };
+        cfg.critic_provider = Some("r".to_string());
+        let (alias, _) = cfg.resolve_role(crate::config::ConfigRole::Critic).unwrap();
+        let to = cfg.resolve_stream_chunk_timeout(&alias);
+        assert_eq!(to.as_secs(), 42);
+
+        let mut providers2 = std::collections::HashMap::new();
+        providers2.insert(
+            "p".to_string(),
+            crate::config::ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                model: Some("m".to_string()),
+                allow_insecure: true,
+                ..Default::default()
+            },
+        );
+        providers2.insert(
+            "r".to_string(),
+            crate::config::ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                model: Some("m".to_string()),
+                allow_insecure: true,
+                ..Default::default()
+            },
+        );
+        let mut cfg2 = crate::config::Config {
+            providers: Some(providers2),
+            stream_chunk_timeout_secs: Some(123),
+            ..Default::default()
+        };
+        cfg2.critic_provider = Some("r".to_string());
+        let (alias2, _) = cfg2
+            .resolve_role(crate::config::ConfigRole::Critic)
+            .unwrap();
+        let to2 = cfg2.resolve_stream_chunk_timeout(&alias2);
+        assert_eq!(to2.as_secs(), 123);
+    }
+
+    #[test]
+    fn oneshot_with_model_accepts_chunk_timeout() {
+        // The timeout error emitted by run_oneshot must contain "timed out"
+        // (case-insensitive) so recovery::classify_error maps it to Network,
+        // matching the streaming path.
+        let err = "stream chunk timed out after 300s (provider stalled or connection dropped)";
+        assert!(err.to_ascii_lowercase().contains("timed out"));
     }
 }

@@ -207,6 +207,10 @@ pub(crate) struct CompactionRequest {
     pub cut_idx: usize,
     /// Token cost of the dropped prefix — for the net-savings check on install.
     pub tokens_before: u64,
+    /// Resolved per-provider (or top-level) stream chunk timeout for the
+    /// summarizer LLM call (oneshot). Compaction uses the same resolution
+    /// as streaming and the other oneshot paths.
+    pub chunk_timeout: std::time::Duration,
 }
 
 pub(crate) struct PruneOnlyCompactionRequest {
@@ -377,12 +381,14 @@ pub(crate) fn prepare_compaction(
         &session.model,
         Some(session.effective_origin()),
     )?;
+    let chunk_timeout = cfg.resolve_stream_chunk_timeout(&session.provider);
 
     Ok(CompactionDecision::Ready(Box::new(CompactionRequest {
         model,
         prompt,
         cut_idx,
         tokens_before,
+        chunk_timeout,
     })))
 }
 

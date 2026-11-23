@@ -25,6 +25,20 @@ use super::{AnyClient, ProviderKind, resolve_api_key_from, resolve_provider_info
 const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const CHATGPT_ORIGINATOR: &str = "dirge";
 
+/// Build a reqwest client with no overall request timeout.
+///
+/// Per-chunk stalls are detected by explicit `tokio::time::timeout` around
+/// each `stream.next()` (see rig_stream and summarize). A client-level
+/// overall timeout would abort long but healthy generations and produce
+/// `client_disconnected` outcomes on the server even when the user has set
+/// generous `stream_chunk_timeout_secs`.
+pub(crate) fn reqwest_no_timeout() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client")
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum ProviderCredential {
     ApiKey(String),
@@ -162,7 +176,7 @@ where
         }
     };
     let client = openai::CompletionsClient::builder()
-        .http_client(compressing(reqwest::Client::new(), ProviderKind::OpenAI))
+        .http_client(compressing(reqwest_no_timeout(), ProviderKind::OpenAI))
         .api_key(&key)
         .build()?;
     Ok(Some(AnyClient::OpenAI(client)))
@@ -523,7 +537,7 @@ where
         }
         ProviderKind::OpenAI => {
             let mut b = openai::CompletionsClient::builder()
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::OpenAI))
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::OpenAI))
                 .api_key(&key);
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
@@ -571,7 +585,7 @@ where
             } else {
                 let mut b = anthropic::Client::builder()
                     .api_key(&key)
-                    .http_client(compressing(reqwest::Client::new(), ProviderKind::Anthropic));
+                    .http_client(compressing(reqwest_no_timeout(), ProviderKind::Anthropic));
                 if let Some(base_url) = &base_url {
                     b = b.base_url(base_url);
                 }
@@ -582,7 +596,7 @@ where
         ProviderKind::Gemini => {
             let mut b = gemini::Client::builder()
                 .api_key(&key)
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::Gemini));
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::Gemini));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -591,7 +605,7 @@ where
         }
         ProviderKind::DeepSeek => {
             let b = openai::CompletionsClient::builder()
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::DeepSeek))
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::DeepSeek))
                 .api_key(&key)
                 .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
@@ -599,7 +613,7 @@ where
         }
         ProviderKind::Glm => {
             let b = openai::CompletionsClient::builder()
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::Glm))
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::Glm))
                 .api_key(&key)
                 .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
@@ -607,14 +621,14 @@ where
         }
         ProviderKind::Cerebras => {
             let b = openai::CompletionsClient::builder()
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::Cerebras))
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::Cerebras))
                 .api_key(&key)
                 .base_url(require_base_url(info.kind, base_url.as_deref())?);
             Ok(AnyClient::Cerebras(b.build()?))
         }
         ProviderKind::OpenCode => {
             let b = openai::CompletionsClient::builder()
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::OpenCode))
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::OpenCode))
                 .api_key(&key)
                 .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
@@ -655,7 +669,7 @@ where
             let key: ollama::OllamaApiKey = key.as_str().into();
             let mut b = ollama::Client::builder()
                 .api_key(key)
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::Ollama));
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::Ollama));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -665,10 +679,7 @@ where
         ProviderKind::OpenRouter => {
             let mut b = openrouter::Client::builder()
                 .api_key(&key)
-                .http_client(compressing(
-                    reqwest::Client::new(),
-                    ProviderKind::OpenRouter,
-                ));
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::OpenRouter));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -677,7 +688,7 @@ where
         }
         ProviderKind::Requesty => {
             let b = openai::CompletionsClient::builder()
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::Requesty))
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::Requesty))
                 .api_key(&key)
                 .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
@@ -685,7 +696,7 @@ where
         }
         ProviderKind::Opper => {
             let b = openai::CompletionsClient::builder()
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::Opper))
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::Opper))
                 .api_key(&key)
                 .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
@@ -694,7 +705,7 @@ where
         ProviderKind::CheaperInference => {
             let b = openai::CompletionsClient::builder()
                 .http_client(compressing(
-                    reqwest::Client::new(),
+                    reqwest_no_timeout(),
                     ProviderKind::CheaperInference,
                 ))
                 .api_key(&key)
@@ -709,7 +720,7 @@ where
                 )
             })?;
             let b = openai::CompletionsClient::builder()
-                .http_client(compressing(reqwest::Client::new(), ProviderKind::Custom))
+                .http_client(compressing(reqwest_no_timeout(), ProviderKind::Custom))
                 .api_key(&key)
                 .base_url(&base_url)
                 .http_headers(headers);
@@ -2858,5 +2869,52 @@ mod tests {
         // The winner's rotated refresh token survives; it isn't overwritten.
         let stored = KimiAuthStore::at(path).load_kimi().unwrap().unwrap();
         assert_eq!(stored.refresh_token(), "R1");
+    }
+
+    // Guards the shared inference client: no overall request timeout, so a
+    // generation that outlives any single deadline is bounded only by the
+    // per-chunk `tokio::time::timeout` around `stream.next()` (rig_stream,
+    // summarize) plus `request_establish`.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn start_delayed_http_server(
+        delay: std::time::Duration,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Drain request bytes so client completes its send side.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(delay).await;
+                let body = b"OK";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+            }
+        });
+        (port, h)
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_for_openai_compatible_does_not_impose_overall_timeout() {
+        // The client must never carry an overall .timeout(): a long but
+        // healthy generation would be cut mid-body and surface upstream as
+        // `client_disconnected`. Stall detection belongs to the per-chunk
+        // timeout in the stream wrapper.
+        let client = reqwest_no_timeout();
+        let (port, server) = start_delayed_http_server(std::time::Duration::from_secs(2)).await;
+        let url = format!("http://127.0.0.1:{}", port);
+        let resp = client.get(&url).send().await;
+        assert!(
+            resp.is_ok(),
+            "total time > chunk timeout must succeed (no overall client timeout): {:?}",
+            resp.err()
+        );
+        let _ = server.await;
     }
 }

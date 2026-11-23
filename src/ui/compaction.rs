@@ -125,10 +125,11 @@ pub(crate) fn spawn(req: CompactionRequest, then: CompactionThen) -> CompactionP
         prompt,
         cut_idx,
         tokens_before,
+        chunk_timeout,
     } = req;
     // Capacity 1: the task sends exactly one terminal event.
     let core = crate::ui::phase::PhaseHandle::spawn(1, move |tx| async move {
-        let event = match crate::provider::run_compaction(model, prompt).await {
+        let event = match crate::provider::run_compaction(model, prompt, chunk_timeout).await {
             Ok(summary) => CompactionPhaseEvent::Done { summary },
             Err(e) => CompactionPhaseEvent::Failed {
                 error: e.to_string(),
