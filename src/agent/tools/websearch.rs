@@ -118,7 +118,7 @@ impl PortableTool for WebSearchTool {
     fn description(&self) -> String {
         crate::agent::agent_loop::tool_input_repair::with_contract_hint(
             "websearch",
-            "Search the web. Returns titles, URLs, and snippets. Use for looking up current documentation, API references, or up-to-date information beyond your training cutoff. Works out of the box without any API key — rotates between Exa and Parallel.ai hosted MCP endpoints (50/50 per process, pin with `DIRGE_WEBSEARCH_PROVIDER=exa|parallel`). Optional `EXA_API_KEY` / `PARALLEL_API_KEY` raise the respective rate limits. DuckDuckGo HTML scrape is the last-resort fallback if both upstream MCP endpoints fail.",
+            "Search the web. Returns titles, URLs, and snippets. Use for looking up current documentation, API references, or up-to-date information beyond your training cutoff. Works out of the box without any API key — rotates between Exa and Parallel.ai hosted MCP endpoints (50/50 per process, pin with `DIRGE_WEBSEARCH_PROVIDER=exa|parallel`, or opt into Keenable's keyless MCP endpoint with `DIRGE_WEBSEARCH_PROVIDER=keenable`). Optional `EXA_API_KEY` / `PARALLEL_API_KEY` raise the respective rate limits. DuckDuckGo HTML scrape is the last-resort fallback if both upstream MCP endpoints fail.",
         )
     }
 
@@ -158,7 +158,7 @@ impl PortableTool for WebSearchTool {
         let primary = selected_provider();
         let secondary = match primary {
             Provider::Exa => Provider::Parallel,
-            Provider::Parallel => Provider::Exa,
+            Provider::Parallel | Provider::Keenable => Provider::Exa,
         };
 
         // Try primary → secondary → DDG fallback. The two
@@ -201,6 +201,9 @@ impl PortableTool for WebSearchTool {
 enum Provider {
     Exa,
     Parallel,
+    /// Opt-in only (`DIRGE_WEBSEARCH_PROVIDER=keenable`); never picked
+    /// by the random rotation.
+    Keenable,
 }
 
 /// One-shot dispatch: pick the right MCP endpoint + tool name + args
@@ -216,6 +219,7 @@ async fn call_provider(
     match provider {
         Provider::Exa => exa_mcp_search(client, exa_key, args).await,
         Provider::Parallel => parallel_mcp_search(client, parallel_key, args).await,
+        Provider::Keenable => keenable_mcp_search(client, args).await,
     }
 }
 
@@ -230,6 +234,7 @@ fn selected_provider() -> Provider {
         match env.to_ascii_lowercase().as_str() {
             "exa" => return Provider::Exa,
             "parallel" => return Provider::Parallel,
+            "keenable" => return Provider::Keenable,
             _ => {} // unknown value — fall through to random
         }
     }
@@ -251,14 +256,10 @@ fn selected_provider() -> Provider {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let candidate = if nanos & 1 == 0 {
-        Provider::Exa
+    let (candidate, candidate_u8) = if nanos & 1 == 0 {
+        (Provider::Exa, 1)
     } else {
-        Provider::Parallel
-    };
-    let candidate_u8 = match candidate {
-        Provider::Exa => 1,
-        Provider::Parallel => 2,
+        (Provider::Parallel, 2)
     };
     match CHOSEN.compare_exchange(0, candidate_u8, Ordering::Release, Ordering::Acquire) {
         Ok(_) => candidate,
@@ -336,6 +337,62 @@ async fn exa_mcp_search(
 
     parse_mcp_response(&body)
         .ok_or_else(|| ToolError::Msg("websearch: no parseable result in MCP response".to_string()))
+}
+
+/// Hit Keenable's keyless public MCP endpoint over plain HTTP. Only used
+/// when pinned with `DIRGE_WEBSEARCH_PROVIDER=keenable`. POSTs a JSON-RPC
+/// `tools/call` envelope for `search_web_pages` to
+/// `https://api.keenable.ai/mcp-public`; no API key or auth header.
+async fn keenable_mcp_search(
+    client: &reqwest::Client,
+    args: &WebSearchArgs,
+) -> Result<String, ToolError> {
+    let envelope = keenable_envelope(args);
+
+    let resp = client
+        .post(KEENABLE_MCP_URL)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "dirge-agent/1.0")
+        .json(&envelope)
+        .send()
+        .await
+        .map_err(|e| ToolError::Msg(format!("websearch (keenable) request failed: {}", e)))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ToolError::Msg(format!("websearch (keenable) read failed: {}", e)))?;
+    if !status.is_success() {
+        return Err(ToolError::Msg(format!(
+            "websearch (keenable) returned {}: {}",
+            status.as_u16(),
+            body.chars().take(300).collect::<String>()
+        )));
+    }
+
+    parse_mcp_response(&body).ok_or_else(|| {
+        ToolError::Msg("websearch (keenable): no parseable result in MCP response".to_string())
+    })
+}
+
+const KEENABLE_MCP_URL: &str = "https://api.keenable.ai/mcp-public";
+
+/// JSON-RPC `tools/call` envelope for Keenable's `search_web_pages` tool.
+/// It takes a single `query` string; result count is chosen server-side.
+fn keenable_envelope(args: &WebSearchArgs) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search_web_pages",
+            "arguments": {
+                "query": args.query,
+            }
+        }
+    })
 }
 
 /// Hit Parallel.ai's hosted MCP endpoint over plain HTTP. Mirrors
@@ -934,6 +991,10 @@ mod tests {
             std::env::set_var("DIRGE_WEBSEARCH_PROVIDER", "parallel");
         }
         assert_eq!(selected_provider(), Provider::Parallel);
+        unsafe {
+            std::env::set_var("DIRGE_WEBSEARCH_PROVIDER", "Keenable");
+        }
+        assert_eq!(selected_provider(), Provider::Keenable);
         // Unknown value falls through to the (memoized) atomic
         // pick; we don't assert which one wins to avoid flake.
         unsafe {
@@ -944,5 +1005,35 @@ mod tests {
         unsafe {
             std::env::remove_var("DIRGE_WEBSEARCH_PROVIDER");
         }
+    }
+
+    #[test]
+    fn keenable_envelope_shape() {
+        let args = WebSearchArgs {
+            query: "rust async runtimes".to_string(),
+            num_results: 5,
+        };
+        let env = keenable_envelope(&args);
+        assert_eq!(env["method"], "tools/call");
+        assert_eq!(env["params"]["name"], "search_web_pages");
+        assert_eq!(env["params"]["arguments"]["query"], "rust async runtimes");
+        assert_eq!(KEENABLE_MCP_URL, "https://api.keenable.ai/mcp-public");
+    }
+
+    /// Live call against Keenable's keyless endpoint. Ignored by default
+    /// (network); run with `cargo test keenable_live -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn keenable_live_search_returns_text() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap();
+        let args = WebSearchArgs {
+            query: "reqwest client timeout example".to_string(),
+            num_results: 5,
+        };
+        let text = keenable_mcp_search(&client, &args).await.unwrap();
+        assert!(text.contains("URL:"), "unexpected body: {text}");
     }
 }

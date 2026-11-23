@@ -1273,6 +1273,7 @@ behavior (e.g. an alias for `/quit` works while the agent is running).
 | Variable | Purpose |
 |----------|---------|
 | `EXA_API_KEY` | API key for the built-in `websearch` tool and the default Exa MCP server. Without this the `websearch` tool emits a startup warning and is not registered. |
+| `DIRGE_WEBSEARCH_PROVIDER` | Pin the built-in `websearch` backend: `exa` or `parallel` (default: one of the two, picked at random per process), or `keenable` to use Keenable's keyless MCP endpoint (`https://api.keenable.ai/mcp-public`) with Exa as fallback. |
 | `DIRGE_WEBFETCH_ALLOW_PRIVATE` | Set to `1` (or any non-empty value) to allow `webfetch` to call private / loopback IPs. By default `webfetch` enforces SSRF protection — it refuses `localhost`, `127.x`, `10.x`, `172.16-31.x`, `192.168.x`, and link-local addresses. Override only in trusted local-dev contexts; never set this in production environments that touch attacker-influenced URLs. |
 | `WEBSEARCH_ENABLED` / `WEBFETCH_ENABLED` | Force-enable the corresponding tool when not enabled via `tools.*` config. Useful in container builds where you set the toggle once via env rather than per-config-file. |
 | `DIRGE_PROMPT_CACHE_TTL` | `5m` or `1h`, overriding `[prompt_cache] ttl`. See [Prompt caching](#prompt-caching) for the cost tradeoff. |
