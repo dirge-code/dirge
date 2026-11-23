@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-11-23
+
+### Fixed
+- `cargo install dirge-agent` could not build 0.27.0 from crates.io: the
+  pinned `evil-janet` 1.37.2 needs bindgen 0.70, which emits opaque structs
+  against libclang 23, so the crates.io publish failed and the version only
+  reached the binary channels. The pin is now `evil-janet` 1.41.3, which
+  builds on current toolchains. (#882)
+- Any Janet plugin doing `(os/execute … :x)` on a command that exits non-zero
+  hung the plugin worker for good after the bump above: Janet 1.41 delivers
+  async failures through `janet_cancel`, which panics unless the parked
+  fiber was started by the event-loop scheduler, and dirge starts each eval
+  directly. The same applied to a refused `net/connect`, `ev/deadline`
+  timeouts, and every other `ev`/`net` error path. Each eval now marks its
+  top-level fiber as a task before running, so those errors surface as
+  normal Janet errors again. The vendored `evil-janet` is rebased onto
+  1.41.3 with both GC fixes carried over.
+
 ## [0.27.0] - 2026-11-23
 
 ### Security
@@ -4633,7 +4651,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.27.1...HEAD
+[0.27.1]: https://github.com/dirge-code/dirge/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/dirge-code/dirge/compare/v0.26.1...v0.27.0
 [0.26.1]: https://github.com/dirge-code/dirge/compare/v0.26.0...v0.26.1
 [0.26.0]: https://github.com/dirge-code/dirge/compare/v0.25.7...v0.26.0
