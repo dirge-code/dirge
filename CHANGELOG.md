@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-11-23
+
 ### Security
 - Bumped rusqlite to 0.41.1 and rmcp to 3.10.0 to resolve
   RUSTSEC-2026-0459, RUSTSEC-2026-0457, RUSTSEC-2026-0461, and
@@ -28,6 +30,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `https://api.stdcmpt.com/v1`. Reasoning effort goes out as a top-level
   `reasoning_effort` clamped to `low`/`medium`/`high`. It is not part of key
   autodetection.
+- Keenable as an opt-in third backend for the built-in `websearch` tool. Pin
+  it with `DIRGE_WEBSEARCH_PROVIDER=keenable`; it calls Keenable's keyless
+  MCP endpoint (`https://api.keenable.ai/mcp-public`, 1,000 requests per
+  hour) and needs no API key. Nothing changes unless you pin it: the Exa and
+  Parallel.ai rotation, the `exa`/`parallel` overrides, and the DuckDuckGo
+  fallback work as before, and when pinned the fallback order is Keenable,
+  then Exa, then DuckDuckGo. (#886)
+
+### Fixed
+- Building with the default `plugin` feature failed on hosts with libclang
+  23: bindgen 0.70 emitted opaque one-field structs for `JanetReg` and
+  friends, so the `janetrs` build died with `no field named name`, `cfun`
+  and `documentation`. The vendored `evil-janet` now uses bindgen 0.73, the
+  deprecated `RustTarget` constant is gone, and `prettyplease` moves to 0.3.0
+  so syn 3 token streams unparse. (#882)
+- Opening the session database while another dirge process was opening it
+  for the first time could print a spurious notice that the disk looks like
+  a network share without WAL support. `journal_mode=WAL` failing with
+  `SQLITE_BUSY` is contention, not evidence about the filesystem, so it is
+  no longer classified that way; the DELETE-journal fallback still runs for
+  every WAL failure. (#392)
+- The OpenAI Responses API gives a tool call two different ids, and dirge
+  stored the item one and replayed it as `call_id` on the next turn. The
+  provider's own `call_id` is now kept for completed Responses tool calls, in
+  execution and in saved sessions, so the correlation matches. Other
+  providers keep their existing id handling; a Gemini function response also
+  keeps the right name and signature when Gemini supplies a distinct call
+  id. (#884, addresses #875)
+- The configured stream-chunk timeout (`stream_chunk_timeout_secs`, or
+  `[timeouts].stream_chunk_secs`) now also bounds the side calls the agent
+  makes outside the main stream — critic, judge, classify, approval,
+  compaction and post-session — which ran against hard-coded 120s/300s
+  deadlines. A slow local backend such as mistral-rs that took longer on one
+  of those calls timed out even after the stream timeout had been raised.
+  The top-level key now reaches the process-wide timeouts too; previously
+  only the `[timeouts]` table did. (#889)
 
 ## [0.26.1] - 2026-10-29
 
@@ -4595,7 +4633,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.26.1...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/dirge-code/dirge/compare/v0.26.1...v0.27.0
 [0.26.1]: https://github.com/dirge-code/dirge/compare/v0.26.0...v0.26.1
 [0.26.0]: https://github.com/dirge-code/dirge/compare/v0.25.7...v0.26.0
 [0.25.7]: https://github.com/dirge-code/dirge/compare/v0.25.6...v0.25.7
