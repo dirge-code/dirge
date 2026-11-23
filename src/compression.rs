@@ -185,6 +185,7 @@ fn accepts_prompt_cache_key(kind: crate::provider::ProviderKind) -> bool {
         | K::Opper
         | K::CheaperInference
         | K::UberLlm
+        | K::StandardCompute
         | K::Custom => false,
     }
 }
@@ -225,6 +226,7 @@ mod tests {
             ProviderKind::Opper,
             ProviderKind::CheaperInference,
             ProviderKind::UberLlm,
+            ProviderKind::StandardCompute,
             ProviderKind::Custom,
         ] {
             assert!(
