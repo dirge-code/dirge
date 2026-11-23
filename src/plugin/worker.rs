@@ -1371,12 +1371,21 @@ const NOTEBOOK_INIT: &str = r#"
 # is reported as data rather than unwinding the whole eval. It does NOT
 # mask user signals, so a deadline interrupt — JANET_SIGNAL_INTERRUPT is
 # USER8 — passes straight through and still stops the cell.
+#
+# `(harness/__root-task)` comes first. Janet >= 1.41 delivers an async
+# failure (os/execute :x, a refused net/connect, ev/deadline, ...) through
+# janet_cancel, which panics unless the parked fiber carries the ROOT
+# flag. Only the ev scheduler sets it, and janet_dobytes starts this form
+# in a plain fiber, so without the marker the panic unwinds out of the
+# loop callback and the worker never replies. See `janet_root_task_cfn`.
+#
 # Whether the last cell evaluated cleanly. Read back by the host in a
 # separate eval rather than encoded into the return value, so a cell whose
 # value happens to look like a status marker cannot be misread as one.
 (var notebook/-last-ok true)
 
 (defn notebook/-eval [sid code]
+  (harness/__root-task)
   (def env (notebook/-env sid))
   (def f (fiber/new (fn [] (eval-string code)) :e))
   (fiber/setenv f env)
@@ -2118,6 +2127,7 @@ fn worker_loop(
     // `CFunOptions::namespace` requires `'static` CStr, so we use C string
     // literals (Rust 1.77+ `c"..."` syntax) instead of runtime CString.
     if let Some(env) = client.env_mut() {
+        env.add_c_fn(root_task_cfun());
         env.add_c_fn(CFunOptions::new(c"__confirm", janet_confirm_cfn).namespace(c"harness"));
         env.add_c_fn(CFunOptions::new(c"__select", janet_select_cfn).namespace(c"harness"));
         env.add_c_fn(
@@ -2337,8 +2347,12 @@ fn run_command_loop(
                 // a status variable afterwards would work but costs a second
                 // round trip on every eval, and hook dispatch is on the hot
                 // path. A sentinel prefix keeps it at one.
+                // `(harness/__root-task)` marks this form's own fiber as a
+                // task, so a later async failure delivered through
+                // janet_cancel reaches the inner fiber instead of panicking
+                // in the loop callback — see `janet_root_task_cfn`.
                 let wrapped = format!(
-                    r#"(let [env (fiber/getenv (fiber/current)) f (fiber/new (fn [] (eval-string "{}")) :e)] (fiber/setenv f env) (let [r (resume f)] (if (= (fiber/status f) :error) (string "{}" (describe r)) r)))"#,
+                    r#"(do (harness/__root-task) (let [env (fiber/getenv (fiber/current)) f (fiber/new (fn [] (eval-string "{}")) :e)] (fiber/setenv f env) (let [r (resume f)] (if (= (fiber/status f) :error) (string "{}" (describe r)) r))))"#,
                     super::escape_janet_string(&code),
                     EV_ERROR_SENTINEL,
                 );
@@ -2389,13 +2403,16 @@ fn run_command_loop(
                 // session's own env. The wrapping happens HERE rather than
                 // in the caller so there is exactly one place that decides
                 // how agent code is sandboxed into a session.
+                // A cell without a session is this form's own body, so the
+                // root-task marker has to be inlined; the session wrapper
+                // (`notebook/-eval`) calls it itself.
                 let to_run = match &session {
                     Some(sid) => format!(
                         r#"(notebook/-eval "{}" "{}")"#,
                         super::escape_janet_string(sid),
                         super::escape_janet_string(&code),
                     ),
-                    None => code.clone(),
+                    None => format!("(do (harness/__root-task) {code})"),
                 };
                 let outcome = client.run(&to_run);
                 // Read the buffers back BEFORE draining/replying, while
@@ -2558,6 +2575,7 @@ fn notebook_worker_loop(
 
     if let Some(env) = client.env_mut() {
         // Pure, host-free, and cells routinely need it. Nothing else.
+        env.add_c_fn(root_task_cfun());
         env.add_c_fn(
             CFunOptions::new(c"__json-extract", janet_json_extract_cfn).namespace(c"harness"),
         );
@@ -2601,6 +2619,41 @@ fn worker_loop(
 }
 
 // --- JanetCFunction shims ----------------------------------------------
+
+/// `harness/__root-task`: flag the running top-level fiber as a task.
+///
+/// Janet 79764371 made `janet_cancel` panic unless the target fiber has
+/// `JANET_FIBER_FLAG_ROOT`, which only `ev/go` and friends set. Every
+/// async failure (an `os/execute` `:x` non-zero exit, a refused
+/// `net/connect`, an `ev/deadline` timeout, ...) is delivered through it,
+/// and `janet_dobytes` starts each top-level form in a plain fiber, so
+/// for an embedder the panic fires inside the loop callback and the
+/// parked fiber is never rescheduled — the worker hangs. Marking the
+/// form's own fiber restores the pre-1.41 behaviour, where the error
+/// surfaces as a normal Janet error. The flag is `0x40000` in 1.37.2 and
+/// 1.41.3 alike, and `janet_root_fiber` is public C API, so this needs
+/// no change to the vendored crate and works against the registry one.
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_root_task_cfn(
+    _argc: i32,
+    _argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    const JANET_FIBER_FLAG_ROOT: i32 = 0x40000;
+    unsafe {
+        let root = janet_root_fiber();
+        if !root.is_null() {
+            (*root).gc.flags |= JANET_FIBER_FLAG_ROOT;
+        }
+        janet_wrap_nil()
+    }
+}
+
+#[cfg(feature = "plugin")]
+fn root_task_cfun() -> CFunOptions<'static> {
+    CFunOptions::new(c"__root-task", janet_root_task_cfn).namespace(c"harness")
+}
+
 //
 // These run on the worker thread under Janet's control. They unwrap
 // argv as strings via evil_janet's raw API, build a DialogRequest, send
@@ -4571,6 +4624,47 @@ mod tests {
             cell.output.contains("before-fail"),
             "output lost when the command failed: {cell:?}"
         );
+    }
+
+    /// Same bug through a different `janet_cancel` call site (net/connect
+    /// refused), so the fix is not tied to the process-wait callback.
+    #[test]
+    fn a_refused_net_connect_on_the_plugin_vm_reports_the_error() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let r = w
+            .eval_with_timeout(r#"(net/connect "127.0.0.1" 9)"#, Duration::from_secs(10))
+            .expect_err("connecting to a closed port must raise");
+        assert!(
+            r.contains("refused") || r.contains("connect"),
+            "unexpected error text: {r}"
+        );
+        assert_eq!(w.eval("(+ 1 2)").unwrap(), "3");
+    }
+
+    /// `eval_cell` without a session runs the code as the top-level form
+    /// itself, so the marker has to be inlined there too. The worker must
+    /// reply with the error rather than hang; `ok` stays `true` on this
+    /// branch by its existing contract (only session cells read a status
+    /// flag back), so the assertion is on the reply arriving at all.
+    #[test]
+    fn a_failing_x_execute_in_a_sessionless_cell_does_not_hang() {
+        let mut w = Worker::try_spawn_notebook().expect("spawn notebook");
+        let cell = w
+            .eval_cell(
+                r#"(os/execute ["/bin/sh" "-c" "exit 9"] :x)"#,
+                None,
+                4096,
+                Duration::from_secs(10),
+            )
+            .expect("the worker must reply");
+        assert!(
+            cell.value.contains("9") || cell.output.contains("9"),
+            "the exit status never surfaced: {cell:?}"
+        );
+        let cell = w
+            .eval_cell("(+ 1 2)", None, 4096, Duration::from_secs(5))
+            .expect("worker usable afterwards");
+        assert!(cell.value.contains('3'), "{cell:?}");
     }
 
     /// dirge-9xjg.3: a cell's `(print …)` has to come back, or the
