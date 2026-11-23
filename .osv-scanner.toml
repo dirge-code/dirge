@@ -25,3 +25,7 @@ reason = "zvariant_derive was merged into zbus 6.0.0; dirge reaches it transitiv
 [[IgnoredVulns]]
 id = "GHSA-qwgh-2vcv-g2f7"
 reason = "block-buffer < 0.12.1 is reached only via gaoya 0.2.2 → sha-1 0.10 (simhash text hashing); gaoya has no newer release. The bug requires catching a panic from inside a compression callback and reusing the buffer, which dirge's usage never does"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono is unmaintained; chrono 0.4.45 is the newest release and no maintained fork exists. Re-evaluate if a fork or a successor crate lands on crates.io"

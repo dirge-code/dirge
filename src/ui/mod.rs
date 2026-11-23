@@ -14,6 +14,7 @@ mod editor_follow;
 pub(crate) mod events;
 pub(crate) mod external_editor;
 pub(crate) mod gitstatus;
+mod herdr;
 mod highlight;
 pub(crate) mod input;
 pub(crate) mod input_reader;
@@ -1648,8 +1649,17 @@ pub async fn run_interactive(
     // dimensions, and rebuild() re-renders the entire scrollback.
     let mut last_resize_dims: Option<(u16, u16)> = None;
     let mut last_panel_refresh: Option<std::time::Instant> = None;
+    let mut herdr_status = herdr::Status::new();
 
     loop {
+        let herdr_state = if !matches!(ui.input_mode, state::InputMode::Compose) {
+            herdr::State::Blocked
+        } else if ui.is_running {
+            herdr::State::Working
+        } else {
+            herdr::State::Idle
+        };
+        herdr_status.update(herdr_state);
         // Refresh the info panel snapshot once per iteration so it stays
         // close to current as the agent edits files, runs MCP tools, etc.
         // Done at loop top (not after each redraw) to avoid touching the
@@ -5333,6 +5343,11 @@ pub async fn run_interactive(
                         };
                         renderer.request_repaint();
                     }
+                    _ = async {
+                        if let Some(deadline) = herdr_status.startup_reannounce_at() {
+                            tokio::time::sleep_until(deadline.into()).await;
+                        }
+                    }, if herdr_status.startup_reannounce_at().is_some() => {}
                     _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if ui.is_running && renderer.animations_enabled() => {
                         // #387: drive the spinner/avatar animation. Force a repaint so
                         // the loop-top render effect advances the spinner (whose tick
