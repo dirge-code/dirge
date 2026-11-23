@@ -269,6 +269,10 @@ dirge --provider opper     # defaults to claude-sonnet-4-6
 export CHEAPER_INFERENCE_API_KEY="..."
 dirge --provider cheaperinference  # defaults to gpt-5.4-mini
 
+# UberLLM is an OpenAI-compatible gateway; model ids are vendor/model
+export UBERLLM_API_KEY="..."
+dirge --provider uberllm   # defaults to deepseek/deepseek-v4-flash
+
 # Verbose mode — debug-level dirge logs + warn-level plugin hook errors
 dirge --verbose
 ```
@@ -375,7 +379,7 @@ thereafter.)
 ## Supported providers
 
 OpenRouter (default), OpenAI, Anthropic, Gemini, DeepSeek, GLM (ZhipuAI),
-Cerebras, OpenCode, Requesty, Opper, Cheaper Inference, Ollama, and any custom OpenAI-compatible endpoint —
+Cerebras, OpenCode, Requesty, Opper, Cheaper Inference, UberLLM, Ollama, and any custom OpenAI-compatible endpoint —
 including GitHub Copilot, which needs no dedicated provider type (see
 [docs/config.md](docs/config.md#github-copilot) for the recipe).
 
@@ -463,7 +467,7 @@ entirely unless you name one. Each value is an **alias** into `providers`.
 
 **Provider aliases.** Each `providers` entry is keyed by an alias you choose.
 `provider_type` is the actual backend (`openai`, `anthropic`, `cerebras`,
-`deepseek`, `gemini`, `glm`, `ollama`, `opencode`, `openrouter`, `requesty`, `opper`, `cheaperinference`, or `custom`).
+`deepseek`, `gemini`, `glm`, `ollama`, `opencode`, `openrouter`, `requesty`, `opper`, `cheaperinference`, `uberllm`, or `custom`).
 It **defaults to the alias** when omitted, which
 is why `"deepseek": { "model": "…" }` needs no `provider_type` but the second
 DeepSeek route must spell it out as a distinct alias (`deepseek-flash`). Point an

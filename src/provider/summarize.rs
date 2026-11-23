@@ -115,6 +115,9 @@ pub(crate) async fn oneshot_with_model(
         super::AnyModel::CheaperInference(m) => {
             run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
         }
+        super::AnyModel::UberLlm(m) => {
+            run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
+        }
         super::AnyModel::Custom(m) => {
             run_oneshot(m, label, preamble, prompt, disable, chunk_timeout).await
         }
@@ -504,6 +507,7 @@ mod tests {
         assert_eq!(reasoning_disable_for_kind("requesty", None), None);
         assert_eq!(reasoning_disable_for_kind("opper", None), None);
         assert_eq!(reasoning_disable_for_kind("cheaperinference", None), None);
+        assert_eq!(reasoning_disable_for_kind("uberllm", None), None);
     }
 
     #[test]
