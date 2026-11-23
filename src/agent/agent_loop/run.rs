@@ -1495,12 +1495,7 @@ const COMPACTION_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// Resolved compaction summarizer timeout. Uses the process-wide stream-chunk
 /// timeout when the user has configured one; otherwise keeps the 120 s constant.
 fn compaction_summary_timeout() -> std::time::Duration {
-    let resolved = crate::timeout::Timeouts::get().stream_chunk;
-    if resolved == crate::timeout::Timeouts::DEFAULT.stream_chunk {
-        COMPACTION_SUMMARY_TIMEOUT
-    } else {
-        resolved
-    }
+    crate::timeout::Timeouts::global_llm_deadline(COMPACTION_SUMMARY_TIMEOUT)
 }
 
 /// Wall-clock ceiling on a background checkpoint summarizer call. The
@@ -1511,12 +1506,7 @@ const CHECKPOINT_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// Resolved checkpoint summarizer timeout. Uses the process-wide stream-chunk
 /// timeout when the user has configured one; otherwise keeps the 120 s constant.
 fn checkpoint_summary_timeout() -> std::time::Duration {
-    let resolved = crate::timeout::Timeouts::get().stream_chunk;
-    if resolved == crate::timeout::Timeouts::DEFAULT.stream_chunk {
-        CHECKPOINT_SUMMARY_TIMEOUT
-    } else {
-        resolved
-    }
+    crate::timeout::Timeouts::global_llm_deadline(CHECKPOINT_SUMMARY_TIMEOUT)
 }
 
 /// Spawn a background incremental checkpoint: summarize a snapshot of the
@@ -1832,7 +1822,8 @@ async fn run_compaction_pass_with_focus(
                         // Bound the inline call: a provider that stalls without
                         // erroring would otherwise freeze the loop indefinitely.
                         // On timeout, keep the pruned context (Failed outcome).
-                        match tokio::time::timeout(compaction_summary_timeout(), sfn(prompt)).await {
+                        match tokio::time::timeout(compaction_summary_timeout(), sfn(prompt)).await
+                        {
                             Ok(r) => r,
                             Err(_) => Err(anyhow::anyhow!(
                                 "compaction summarizer timed out after {}s",

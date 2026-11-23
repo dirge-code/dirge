@@ -58,12 +58,7 @@ pub(crate) const JUDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// Resolved judge timeout. Uses the process-wide stream-chunk timeout when
 /// the user has configured one; otherwise keeps the historical 120 s constant.
 pub(crate) fn judge_timeout() -> std::time::Duration {
-    let resolved = crate::timeout::Timeouts::get().stream_chunk;
-    if resolved == crate::timeout::Timeouts::DEFAULT.stream_chunk {
-        JUDGE_TIMEOUT
-    } else {
-        resolved
-    }
+    crate::timeout::Timeouts::global_llm_deadline(JUDGE_TIMEOUT)
 }
 
 /// Run a judge-style completion, failing open on error. Centralizes the

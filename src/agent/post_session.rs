@@ -97,12 +97,7 @@ const STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Resolved per-stage timeout. Uses the process-wide stream-chunk timeout
 /// when the user has configured one; otherwise keeps the 300 s constant.
 fn stage_timeout() -> Duration {
-    let resolved = crate::timeout::Timeouts::get().stream_chunk;
-    if resolved == crate::timeout::Timeouts::DEFAULT.stream_chunk {
-        STAGE_TIMEOUT
-    } else {
-        resolved
-    }
+    crate::timeout::Timeouts::global_llm_deadline(STAGE_TIMEOUT)
 }
 
 /// A named post-session stage: a future that runs one learning

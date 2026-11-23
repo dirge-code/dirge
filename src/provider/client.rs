@@ -2871,10 +2871,10 @@ mod tests {
         assert_eq!(stored.refresh_token(), "R1");
     }
 
-    // TDD test for the 120s/300s `client_disconnected` root cause.
-    // The overall reqwest timeout must not be set to the chunk-timeout value.
-    // Only the explicit per-chunk `tokio::time::timeout` around `stream.next()`
-    // (in rig_stream etc) plus `request_establish` should bound things.
+    // Guards the shared inference client: no overall request timeout, so a
+    // generation that outlives any single deadline is bounded only by the
+    // per-chunk `tokio::time::timeout` around `stream.next()` (rig_stream,
+    // summarize) plus `request_establish`.
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn start_delayed_http_server(
@@ -2902,14 +2902,10 @@ mod tests {
 
     #[tokio::test]
     async fn reqwest_client_for_openai_compatible_does_not_impose_overall_timeout() {
-        // Before the fix, the OpenAI-compatible (and custom base_url for mistralrs)
-        // path built its reqwest client with an overall .timeout equal to the
-        // chunk timeout. A generation whose total duration exceeded that value
-        // produced a reqwest TimedOut, dropping the body and causing mistralrs
-        // to log client_disconnected at ~120s/300s.
-        //
-        // Desired: no overall timeout on the client; per-chunk deadlines are
-        // enforced separately via tokio::time::timeout in the stream wrapper.
+        // The client must never carry an overall .timeout(): a long but
+        // healthy generation would be cut mid-body and surface upstream as
+        // `client_disconnected`. Stall detection belongs to the per-chunk
+        // timeout in the stream wrapper.
         let client = reqwest_no_timeout();
         let (port, server) = start_delayed_http_server(std::time::Duration::from_secs(2)).await;
         let url = format!("http://127.0.0.1:{}", port);
